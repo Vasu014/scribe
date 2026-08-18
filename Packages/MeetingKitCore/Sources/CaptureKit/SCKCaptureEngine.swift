@@ -117,17 +117,20 @@ public final class SCKCaptureEngine: NSObject, CaptureEngine, @unchecked Sendabl
 
     // MARK: Start order — SPEC §4.1/§7 Spike 1 outcome
 
-    /// Start order pinned by Spike 1 (SPEC §4.1: "determined by the §7 spike
-    /// (default hypothesis: SCStream first, then engine)").
+    /// Spec-pinned default start order (SPEC §4.1: "determined by the §7
+    /// spike (default hypothesis: SCStream first, then engine)") — the
+    /// default value of `Configuration.startOrder`, the knob the Spike-1
+    /// matrix varies (harness: `Tools/SpikeHarness`, runner:
+    /// `scripts/spike1-run.sh`, `docs/spikes/spike1.md`).
     ///
     /// Current value = the default hypothesis. The Spike-1 matrix —
     /// {SCStream first, engine first} × {VP on, off} × {machine 1, 2},
-    /// 8 runs, `docs/spikes/spike1.md` — validates or flips this. When the
-    /// results land, record the tested macOS build numbers here and update
-    /// the constant if the matrix disagrees.
+    /// 8 runs — validates or flips this. When the results land, record the
+    /// tested macOS build numbers here and update the constant if the
+    /// matrix disagrees.
     ///
     /// Tested macOS builds: **pending Spike 1 (T10 hardware runs)**.
-    public static let startOrder: RemoteStartOrder = .screenCaptureKitFirst
+    public static let defaultStartOrder: RemoteStartOrder = .screenCaptureKitFirst
 
     // MARK: Configuration
 
@@ -139,8 +142,17 @@ public final class SCKCaptureEngine: NSObject, CaptureEngine, @unchecked Sendabl
     public struct Configuration: Sendable {
         public var voiceProcessingEnabled: Bool
 
-        public init(voiceProcessingEnabled: Bool = true) {
+        /// Which capture backend activates first at session begin — the
+        /// Spike-1 matrix knob (SPEC §4.1/§7). Defaults to the spec-pinned
+        /// `SCKCaptureEngine.defaultStartOrder`; the harness overrides it
+        /// per matrix cell. Whatever the matrix decides, the winner gets
+        /// pinned back into `defaultStartOrder`.
+        public var startOrder: RemoteStartOrder
+
+        public init(voiceProcessingEnabled: Bool = true,
+                    startOrder: RemoteStartOrder = SCKCaptureEngine.defaultStartOrder) {
             self.voiceProcessingEnabled = voiceProcessingEnabled
+            self.startOrder = startOrder
         }
     }
 
@@ -251,9 +263,10 @@ public final class SCKCaptureEngine: NSObject, CaptureEngine, @unchecked Sendabl
             self.registerObserversLocked()
         }
 
-        // Start order per Spike 1 (see `startOrder` doc comment).
+        // Start order per `config.startOrder` (Spike 1 knob; see
+        // `defaultStartOrder` doc comment).
         do {
-            switch Self.startOrder {
+            switch config.startOrder {
             case .screenCaptureKitFirst:
                 if screenGranted {
                     await startRemoteStream(generation: generation, clock: clock)

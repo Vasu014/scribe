@@ -29,7 +29,7 @@ Legend: □ todo · ◐ in flight · ✔ done · — blocked/not started
 | # | Task | Depends | Status | Summary |
 |---|------|---------|--------|---------|
 | T9 | Release engineering | all | ✔ | Sparkle 2 SPM + appcast template, notarytool script (env-gated; team ID placeholder), hardened-runtime check, root README (build/test/layout). |
-| T10 | Dogfood hardening | T4 | ◐ | Spike-1 matrix runs (hardware), device-switch/sleep/permission-revocation passes. **Manual — not dispatchable**: run `docs/spikes/spike1.md` on both machines, record build numbers + start-order/VP outcome as code comments in `SCKCaptureEngine`, then dogfood toward the Phase 0 exit gate (SPEC §2). |
+| T10 | Dogfood hardening | T4 | ◐ | Harness landed (S1): `Tools/SpikeHarness` + `scripts/spike1-run.sh`; **smoke matrix 4/4 OK on macOS 26.3** (90 s runs, both channels continuous, no degradation). Remaining: full 600 s matrix on both machines (+ AirPods pass), pin outcome in `SCKCaptureEngine`, sleep/permission-revocation passes, then dogfood toward the Phase 0 exit gate (SPEC §2). |
 
 ## Notes for every task
 - SPEC.md section citations in code comments where behavior is specced.
