@@ -24,6 +24,7 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
     private var menuBarController: MenuBarController!
     private var scratchpadPanel: ScratchpadPanelController!
     private var settingsWindowController: SettingsWindowController!
+    private var historyWindowController: HistoryWindowController!
     private var hotkey: GlobalHotkey?
     private var eventTask: Task<Void, Never>?
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -93,9 +94,16 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
             scratchpadPanel?.show()
         }
 
-        // History is T7; until then done-state clicks no-op (the closure
-        // stays nil by design — MenuBarController treats nil as a no-op).
-        // menuBarController.onOpenHistory = { sessionId in … }
+        // MARK: History window (SPEC §5; T7).
+        historyWindowController = HistoryWindowController(store: store, coordinator: coordinator)
+        menuBarController.onShowHistory = { [weak historyWindowController] in
+            historyWindowController?.show()
+        }
+        // Menu-bar done-badge click opens that session in History (SPEC §5)
+        // — the done event carries the sessionId.
+        menuBarController.onOpenHistory = { [weak historyWindowController] sessionId in
+            historyWindowController?.show(sessionId: sessionId)
+        }
 
         // MARK: Global hotkey ⌥⌘N (SPEC §5: Carbon RegisterEventHotKey; no
         // NSEvent global monitors, no Accessibility permission).
@@ -104,25 +112,26 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
             scratchpadPanel?.toggle()
         }
 
-        // MARK: Coordinator events (app-level log; menu bar renders states,
-        // History T7 will surface findings/failures/recovery in UI).
+        // MARK: Coordinator events (app-level log; menu bar and History
+        // render states — History surfaces findings/failures/recovery as
+        // inline warning cards and row meta).
         let coordinator: SessionCoordinator = coordinator
         eventTask = Task { [coordinator] in
             for await event in coordinator.events() {
                 switch event {
                 case .stateChanged:
-                    break // rendered by MenuBarController
+                    break // rendered by MenuBarController + History
                 case .recoveredSessions(let sessions):
                     logger.warning("""
                     Crash recovery (SPEC §4.4): \(sessions.count) session(s) found interrupted \
-                    and marked recovered — fusion retry from History once T7 lands.
+                    and marked recovered — fusion retry available from History.
                     """)
                 case .deviceEventLogged(let event):
                     logger.info("Device event logged: \(event.kind, privacy: .public) @ \(event.offset, privacy: .public)s")
                 case .fusionFindings(let sessionId, let findings):
                     logger.warning("""
                     Validator findings (SPEC §4.5) on \(sessionId.uuidString, privacy: .public): \
-                    \(findings.count) citation(s) flagged.
+                    \(findings.count) citation(s) flagged — surfaced in History notes.
                     """)
                 case .fusionFailed(let sessionId, let message):
                     logger.error("""

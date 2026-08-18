@@ -36,8 +36,15 @@ final class MenuBarController: NSObject {
     var onOpenScratchpad: (() -> Void)? {
         didSet { scratchpadItem?.isEnabled = onOpenScratchpad != nil }
     }
-    /// Open the History window at a session — wired when T7 lands; `nil`
-    /// means done-state clicks no-op for now.
+    /// Open the History window's list view — set by ScribeApp once the
+    /// window exists (T7); setting it enables the menu item (disabled until
+    /// wired).
+    var onShowHistory: (() -> Void)? {
+        didSet { historyItem?.isEnabled = onShowHistory != nil }
+    }
+    /// Open the History window AT a session — menu-bar done-badge click
+    /// (SPEC §5: the done transient is clickable → opens the session in
+    /// History); the done event carries the sessionId. Set by ScribeApp.
     var onOpenHistory: ((UUID) -> Void)?
 
     private let statusItem: NSStatusItem
@@ -46,6 +53,7 @@ final class MenuBarController: NSObject {
     private var startStopItem: NSMenuItem!
     private var retryItem: NSMenuItem!
     private var scratchpadItem: NSMenuItem!
+    private var historyItem: NSMenuItem!
 
     private var displayState: SessionDisplayState
     private var eventTask: Task<Void, Never>?
@@ -107,7 +115,8 @@ final class MenuBarController: NSObject {
 
         let history = NSMenuItem(title: "History…", action: #selector(openHistory), keyEquivalent: "")
         history.target = self
-        history.isEnabled = false // TODO(T7): history window
+        history.isEnabled = false // enabled when ScribeApp wires onShowHistory (T7)
+        historyItem = history
 
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
@@ -188,7 +197,7 @@ final class MenuBarController: NSObject {
     }
 
     @objc private func openHistory() {
-        // TODO(T7): open the History window.
+        onShowHistory?() // History window list view (T7)
     }
 
     @objc private func openSettings() {
@@ -197,7 +206,7 @@ final class MenuBarController: NSObject {
 
     @objc private func statusItemClicked() {
         guard case .done(let sessionId) = displayState else { return }
-        onOpenHistory?(sessionId) // T7 wires History; nil closure → no-op for now
+        onOpenHistory?(sessionId) // History opens at the session (T7)
         endDoneTransient()
     }
 
@@ -217,8 +226,8 @@ final class MenuBarController: NSObject {
         case .stateChanged(let state):
             transition(to: state)
         case .recoveredSessions(let sessions):
-            // History (T7) surfaces these for retry; app-level log meanwhile.
-            logger.warning("Recovered \(sessions.count) interrupted session(s) — fusion retry from History once T7 lands.")
+            // History surfaces these for retry; app-level log meanwhile.
+            logger.warning("Recovered \(sessions.count) interrupted session(s) — fusion retry available from History.")
         case .fusionFindings, .fusionFailed, .deviceEventLogged:
             break // logged by ScribeApp; surfaced in History (T7)
         }
