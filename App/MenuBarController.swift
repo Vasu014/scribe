@@ -1,4 +1,5 @@
 import AppKit
+import CaptureKit
 import os
 import SessionKit
 
@@ -46,6 +47,16 @@ final class MenuBarController: NSObject {
     /// (SPEC §5: the done transient is clickable → opens the session in
     /// History); the done event carries the sessionId. Set by ScribeApp.
     var onOpenHistory: ((UUID) -> Void)?
+
+    /// Start-flow permission guard (T8): when true and Start Meeting is
+    /// clicked while mic or Screen Recording TCC is missing,
+    /// `onPermissionsMissing` fires instead of starting — ScribeApp opens
+    /// the setup wizard at the relevant step rather than letting the start
+    /// fail silently (mic) or degrade quietly (screen, SPEC §4.1). Disabled
+    /// when the debug stub engine is active (no TCC involved).
+    var permissionGuardEnabled = false
+    /// Fired by the start guard above — ScribeApp routes it to the wizard.
+    var onPermissionsMissing: (() -> Void)?
 
     private let statusItem: NSStatusItem
     private let spinner = NSProgressIndicator()
@@ -177,12 +188,20 @@ final class MenuBarController: NSObject {
             Task { await coordinator.stop() } // stop → processing → fusion (SPEC §4.4)
             return
         }
+        // T8 start guard: a start without TCC would throw (mic) or silently
+        // degrade to mic-only (screen) — route to the wizard instead.
+        if permissionGuardEnabled,
+           CapturePermissions.microphone != .granted
+            || CapturePermissions.screenRecording == .denied {
+            onPermissionsMissing?()
+            return
+        }
         Task {
             do {
                 try await coordinator.start()
             } catch {
-                // Stub engine can't fail today; real permission failures are
-                // the T8 setup wizard's job.
+                // Permission loss is preempted by the guard above; anything
+                // reaching here is an engine failure worth logging.
                 logger.error("Meeting start failed: \(String(describing: error), privacy: .public)")
             }
         }

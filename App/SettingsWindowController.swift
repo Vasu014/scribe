@@ -34,6 +34,10 @@ enum SettingsKeys {
         let raw = UserDefaults.standard.string(forKey: whisperModel) ?? ""
         return WhisperModelOption(named: raw)?.name ?? defaultWhisperModel
     }
+
+    /// DEBUG (T8): run `StubCaptureEngine` instead of `SCKCaptureEngine`
+    /// (Bool, default false) — menu-bar/UI development without TCC prompts.
+    static let debugUseStubCapture = "debugUseStubCapture"
 }
 
 /// Whisper model picker entries (SPEC §4.2: `tiny.en` / `base.en` /

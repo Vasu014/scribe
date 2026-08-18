@@ -22,13 +22,13 @@ Legend: □ todo · ◐ in flight · ✔ done · — blocked/not started
 | T5 | Menu bar shell + Settings + hotkey | T2 | ✔ | `MenuBarController` (5 derived states incl. done-transient 4s + persistent failed, wall-clock elapsed, dot pulse); `SettingsWindow` (Keychain API key masked, model picker, lookback, SMAppService login); Carbon `RegisterEventHotKey` ⌥⌘N. Follows design/ + macos-patterns skill. |
 | T6 | Scratchpad panel | T2, T5 | ✔ | Floating `.nonactivatingPanel` HUD, header (dot+elapsed+hint+Stop / no-meeting state), text body → `FragmentComposer` wiring, saved tick on persist, Esc dismiss, summon animation w/ Reduce Motion fallback. |
 | T7 | History window + exporters | T1, T2 | ✔ | Sidebar (title/meta/date/recovered tag, fused/fusing/failed) + detail (Notes/Transcript toggle, rendered markdown, inline validator cards, static action checkboxes); actions: export markdown (notes + `<details>` transcript), retry fusion, export eval case (optional corrected output), delete. Empty state per design 2d. |
-| T8 | Setup wizard | T5, T3 | ◐ | `setupPhase`-persisted flow: permission explain → mic prompt → screen-recording prompt → relaunch instruction → model download progress → API key entry → done. |
+| T8 | Setup wizard | T5, T3 | ✔ | `setupPhase`-persisted flow: permission explain → mic prompt → screen-recording prompt → relaunch instruction → model download progress → API key entry → done. |
 
 ## Wave 3 — hardening & release
 
 | # | Task | Depends | Status | Summary |
 |---|------|---------|--------|---------|
-| T9 | Release engineering | all | □ | Sparkle 2 SPM + appcast template, notarytool script (env-gated; team ID placeholder), hardened-runtime check, root README (build/test/layout). |
+| T9 | Release engineering | all | ◐ | Sparkle 2 SPM + appcast template, notarytool script (env-gated; team ID placeholder), hardened-runtime check, root README (build/test/layout). |
 | T10 | Dogfood hardening | T4 | — | Spike-1 matrix runs (hardware), device-switch/sleep/permission-revocation passes. Manual; post-dogfood. |
 
 ## Notes for every task

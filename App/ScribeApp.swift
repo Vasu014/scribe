@@ -14,6 +14,7 @@ import os
 /// (SessionKit — the composition root), menu bar, Settings, and the global
 /// hotkey. Components communicate ONLY through the store (SPEC §3.1
 /// load-bearing rule); nothing here routes module-to-module.
+@MainActor
 @main
 final class ScribeApp: NSObject, NSApplicationDelegate {
 
@@ -25,6 +26,7 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
     private var scratchpadPanel: ScratchpadPanelController!
     private var settingsWindowController: SettingsWindowController!
     private var historyWindowController: HistoryWindowController!
+    private var setupWizardController: SetupWizardController?
     private var hotkey: GlobalHotkey?
     private var eventTask: Task<Void, Never>?
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -55,11 +57,24 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
             }
         }
 
-        // MARK: Coordinator (SPEC §4.4).
-        // TODO(T8): replace StubCaptureEngine with SCKCaptureEngine and
-        // UnimplementedTranscriber with the WhisperKit transcriber during
-        // setup-wizard wiring. The stubs keep the full lifecycle — start,
-        // stop, fusion, retry, crash recovery — exercisable meanwhile.
+        // MARK: Coordinator (SPEC §4.4) + real engines (T8).
+        // SCKCaptureEngine is the production capture path (voice processing
+        // on by default, SPEC §4.1); the stub stays available behind the
+        // `debugUseStubCapture` UserDefaults flag for UI development
+        // without TCC prompts. Transcription is real too —
+        // LazyWhisperKitTranscriber loads the persisted model LAZILY at the
+        // first session start (model load is slow; the menu bar must not
+        // wait for it) and falls back to UnimplementedTranscriber + a log
+        // when the model folder is missing (the wizard normally prevents
+        // that).
+        let useStubCapture = UserDefaults.standard.bool(forKey: SettingsKeys.debugUseStubCapture)
+        let captureEngine: any CaptureEngine
+        if useStubCapture {
+            logger.info("debugUseStubCapture = true — StubCaptureEngine active (UI development, no TCC).")
+            captureEngine = StubCaptureEngine()
+        } else {
+            captureEngine = SCKCaptureEngine()
+        }
         let keychain = KeychainStore()
         let provider = AnthropicFusionProvider(keychain: keychain)
         let lookback = SettingsKeys.lookback // launch-time read; see SettingsKeys docs
@@ -70,17 +85,40 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
         )
         coordinator = SessionCoordinator(
             store: store,
-            captureEngine: StubCaptureEngine(),
-            transcriber: UnimplementedTranscriber(),
+            captureEngine: captureEngine,
+            transcriber: LazyWhisperKitTranscriber(),
             lookback: lookback,
             fusionRunner: fusionRunner
         )
+
+        // MARK: Engine callbacks (SPEC §4.1).
+        // Device switches are rebuilt INSIDE the engine; the coordinator's
+        // handleDeviceChange() logs the `deviceChanged` timeline event.
+        // Remote degradation (permission revoked / SCStream double failure)
+        // degrades to mic-only — logged here.
+        // TODO(T9+): surface degradation in UI (menu-bar notice / History row meta).
+        if let sckEngine = captureEngine as? SCKCaptureEngine {
+            sckEngine.onDeviceChange = { [weak coordinator] in
+                coordinator?.handleDeviceChange()
+            }
+            sckEngine.onRemoteDegraded = { [weak self] reason in
+                self?.logger.warning("System audio degraded to mic-only: \(reason, privacy: .public)")
+            }
+        }
 
         // MARK: Surfaces.
         settingsWindowController = SettingsWindowController()
         menuBarController = MenuBarController(coordinator: coordinator)
         menuBarController.onOpenSettings = { [weak settingsWindowController] in
             settingsWindowController?.show()
+        }
+        // Start-flow permission guard (T8): clicking Start with mic or
+        // screen TCC missing opens the wizard at the relevant step instead
+        // of failing silently. The stub path skips TCC entirely.
+        menuBarController.permissionGuardEnabled = !useStubCapture
+        menuBarController.onPermissionsMissing = { [weak self] in
+            guard let self, let step = SetupWizardPhase.firstMissingPermission else { return }
+            self.showSetupWizard(at: step)
         }
         // MARK: Scratchpad panel (SPEC §4.3 + §5).
         // The composer is APP-OWNED; `attach` installs its persist/freeze
@@ -157,6 +195,22 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
                 coordinator?.handleWake()
             },
         ]
+
+        // MARK: First-run setup wizard (T8; SPEC §4.1/§5) — shown after the
+        // menu bar is ready. Resumes at the persisted phase (the Screen
+        // Recording TCC grant forces a quit-and-reopen, SPEC §4.1); once
+        // completed (phase 5) it never shows on launch again.
+        if SetupWizardPhase.persisted != .completed {
+            showSetupWizard(at: SetupWizardPhase.persisted)
+        }
+    }
+
+    /// Lazily creates and shows the setup wizard at a step.
+    private func showSetupWizard(at step: SetupWizardPhase) {
+        if setupWizardController == nil {
+            setupWizardController = SetupWizardController()
+        }
+        setupWizardController?.show(at: step)
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
