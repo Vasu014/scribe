@@ -43,6 +43,11 @@ public struct FusionOutput: Sendable, Equatable {
 /// changes. The Anthropic implementation arrives with the fusion task; UI and
 /// SessionKit code against this seam in the meantime.
 public protocol FusionProvider: Sendable {
+    /// Identifier of the backing model — recorded on note rows (SPEC §4.6
+    /// `notes.model`) and eval cases (SPEC §4.5 `model`) so provenance
+    /// follows every output.
+    var modelIdentifier: String { get }
+
     /// - Parameters:
     ///   - systemPrompt: assembled system prompt (role, format, grounding rules)
     ///   - userPrompt: assembled user message (rendered transcript + notes)
@@ -66,6 +71,21 @@ public enum PromptAssembler {
             fragments: input.fragments,
             lookback: input.lookback
         )
+    }
+
+    /// User message for the final COMPOSE call of a chunked long meeting
+    /// (SPEC §4.5): merges per-chunk notes into one set. Chunk notes carry
+    /// global session timestamps already. Part of the versioned prompt text
+    /// — any change bumps `PromptVersion.current`.
+    public static func composeUserPrompt(chunkNotes: [String]) -> String {
+        let parts = chunkNotes.enumerated().map { index, notes in
+            "--- Notes for part \(index + 1) of \(chunkNotes.count) ---\n\(notes)"
+        }
+        return """
+        The notes below were written in parts covering consecutive stretches of ONE long meeting; their timestamps are global session timestamps and are already correct. Consolidate them into a single set of notes in the required format: merge duplicates, keep the strongest evidence, and keep a verbatim quote with its existing timestamp for every Decision and Action item — never invent timestamps or quotes.
+
+        \(parts.joined(separator: "\n\n"))
+        """
     }
 
     /// Extracts the `Title:` line (output format §0) and sanitizes it for
