@@ -39,5 +39,9 @@ let package = Package(
         .target(name: "SessionKit", dependencies: [
             "Persistence", "CaptureKit", "TranscribeKit", "ScratchpadKit", "FusionKit",
         ]),
+        .testTarget(name: "SessionKitTests", dependencies: [
+            "SessionKit", "CaptureKit", "TranscribeKit", "ScratchpadKit",
+            "FusionKit", "Persistence",
+        ]),
     ]
 )
