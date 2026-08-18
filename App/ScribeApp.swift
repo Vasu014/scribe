@@ -27,6 +27,10 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController!
     private var historyWindowController: HistoryWindowController!
     private var setupWizardController: SetupWizardController?
+    /// Sparkle updater (SPEC §6; T9). Held as a property so the
+    /// SPUStandardUpdaterController exists before applicationDidFinishLaunching
+    /// returns (Sparkle's requirement); started at the end of launch.
+    private let updaterManager = UpdaterManager.shared
     private var hotkey: GlobalHotkey?
     private var eventTask: Task<Void, Never>?
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -195,6 +199,10 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
                 coordinator?.handleWake()
             },
         ]
+
+        // MARK: Sparkle updates (SPEC §6; T9) — starts the automatic
+        // update schedule; no-op in DEBUG builds.
+        updaterManager.start()
 
         // MARK: First-run setup wizard (T8; SPEC §4.1/§5) — shown after the
         // menu bar is ready. Resumes at the persisted phase (the Screen

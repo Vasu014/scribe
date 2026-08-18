@@ -28,7 +28,7 @@ Legend: □ todo · ◐ in flight · ✔ done · — blocked/not started
 
 | # | Task | Depends | Status | Summary |
 |---|------|---------|--------|---------|
-| T9 | Release engineering | all | ◐ | Sparkle 2 SPM + appcast template, notarytool script (env-gated; team ID placeholder), hardened-runtime check, root README (build/test/layout). |
+| T9 | Release engineering | all | ✔ | Sparkle 2 SPM + appcast template, notarytool script (env-gated; team ID placeholder), hardened-runtime check, root README (build/test/layout). |
 | T10 | Dogfood hardening | T4 | — | Spike-1 matrix runs (hardware), device-switch/sleep/permission-revocation passes. Manual; post-dogfood. |
 
 ## Notes for every task

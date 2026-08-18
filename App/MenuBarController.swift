@@ -1,5 +1,6 @@
 import AppKit
 import CaptureKit
+import Combine
 import os
 import SessionKit
 
@@ -65,6 +66,8 @@ final class MenuBarController: NSObject {
     private var retryItem: NSMenuItem!
     private var scratchpadItem: NSMenuItem!
     private var historyItem: NSMenuItem!
+    private var checkForUpdatesItem: NSMenuItem!
+    private var updatesCancellable: AnyCancellable?
 
     private var displayState: SessionDisplayState
     private var eventTask: Task<Void, Never>?
@@ -102,6 +105,17 @@ final class MenuBarController: NSObject {
 
         applyVisual(for: displayState)
         subscribeToEvents()
+
+        // Sparkle (SPEC §6): flip "Check for Updates…" on once the updater
+        // is started and idle. `canCheckForUpdates` bridges from Sparkle's
+        // KVO; `.receive(on: main)` because the sink touches AppKit.
+        updatesCancellable = UpdaterManager.shared.$canCheckForUpdates
+            .receive(on: RunLoop.main)
+            .sink { [weak self] canCheck in
+                MainActor.assumeIsolated {
+                    self?.checkForUpdatesItem.isEnabled = canCheck
+                }
+            }
     }
 
     // MARK: - Menu (design/README "Menu")
@@ -132,6 +146,15 @@ final class MenuBarController: NSObject {
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
 
+        // Check for Updates… (Sparkle 2, SPEC §6; T9). Menu placement chosen
+        // over a Settings footer — Scribe's primary surface is this menu.
+        // Enabled only when the updater is running (never in DEBUG: Sparkle
+        // must not run against debug builds — see UpdaterManager).
+        let updates = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        updates.target = self
+        updates.isEnabled = false
+        checkForUpdatesItem = updates
+
         // target nil → responder chain reaches NSApplication.terminate.
         let quit = NSMenuItem(title: "Quit Scribe", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
@@ -141,6 +164,7 @@ final class MenuBarController: NSObject {
         menu.addItem(scratchpad)
         menu.addItem(history)
         menu.addItem(settings)
+        menu.addItem(updates)
         menu.addItem(.separator())
         menu.addItem(quit)
         self.menu = menu
@@ -221,6 +245,13 @@ final class MenuBarController: NSObject {
 
     @objc private func openSettings() {
         onOpenSettings?()
+    }
+
+    /// Sparkle manual update check (SPEC §6). UpdaterManager temporarily
+    /// switches Scribe to a regular activation policy so Sparkle's update
+    /// window can take focus (accessory app, LSUIElement). No-op in DEBUG.
+    @objc private func checkForUpdates() {
+        UpdaterManager.shared.checkForUpdates()
     }
 
     @objc private func statusItemClicked() {

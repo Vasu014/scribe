@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Scribe Sparkle appcast template (SPEC §6; T9).
+
+     Hosted copy must match SUFeedURL (baked into Info.plist at build time —
+     see scripts/release.sh / SCRIBE_FEED_URL). One <item> per release; the
+     sparkle:edSignature + length attributes come from Sparkle's sign_update:
+
+         /path/to/sign_update Scribe-0.1.0.dmg
+         # -> sparkle:edSignature="…" length="…"
+
+     The item below is a PLACEHOLDER — replace it with the first real signed
+     release (signing week). -->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Scribe</title>
+    <description>Most recent changes to Scribe.</description>
+    <language>en</language>
+    <item>
+      <title>Version 0.1.0 (Build 1)</title>
+      <pubDate>Mon, 1 Jan 2024 12:00:00 +0000</pubDate>
+      <sparkle:version>1</sparkle:version>
+      <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p>Placeholder entry — replace at signing week with the first notarized build.</p>]]></description>
+      <enclosure url="https://example.com/scribe/Scribe-0.1.0.dmg"
+                 type="application/octet-stream"
+                 sparkle:edSignature="REPLACE_WITH_sign_update_OUTPUT"
+                 length="0" />
+    </item>
+  </channel>
+</rss>

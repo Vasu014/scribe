@@ -8,8 +8,18 @@ settings:
   base:
     SWIFT_VERSION: "5.10"
     ARCHS: [arm64]
-    HARDENED_RUNTIME_ENABLE: YES
+    # SPEC §6: hardened runtime (Developer ID notarization requires it).
+    ENABLE_HARDENED_RUNTIME: YES
     SUPPORTS_MACCATALYST: NO
+    # Sparkle (SPEC §6; T9): Info.plist substitutes these via
+    # $(SUFEED_URL)/$(SUPUBLIC_ED_KEY). Placeholders here for dev builds;
+    # scripts/release.sh overrides SUFEED_URL from SCRIBE_FEED_URL (and
+    # SUPUBLIC_ED_KEY from SCRIBE_PUBLIC_ED_KEY at signing week — see
+    # App/dsa_pub.pem + scripts/README.md).
+    SUFEED_URL: "https://example.com/scribe/appcast.xml"
+    SUPUBLIC_ED_KEY: ""
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
 targets:
   Scribe:
     type: application
@@ -24,14 +34,21 @@ targets:
           - FusionKit
           - SessionKit
           - Persistence
+      # Sparkle 2, APP TARGET ONLY (SPEC §6; T9) — never a MeetingKitCore dep.
+      - package: Sparkle
     info:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Scribe
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSMicrophoneUsageDescription: "Scribe records your microphone during meetings you start, so it can transcribe what you say. Audio never leaves your Mac and is never saved to disk."
+        # Sparkle (SPEC §6; T9) — substituted at build time; see settings.base
+        # above and scripts/release.sh.
+        SUFeedURL: "$(SUFEED_URL)"
+        SUPublicEDKey: "$(SUPUBLIC_ED_KEY)"
+        SUEnableInstallerLauncherService: true
     entitlements:
       path: App/Scribe.entitlements
       properties:
@@ -40,6 +57,9 @@ targets:
 packages:
   MeetingKitCore:
     path: Packages/MeetingKitCore
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.0
 schemes:
   Scribe:
     build:

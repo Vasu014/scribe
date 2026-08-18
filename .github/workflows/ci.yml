@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-15 # arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Package tests
+        run: cd Packages/MeetingKitCore && swift test
+
+      - name: Build app (unsigned)
+        run: set -o pipefail && xcodebuild -project Scribe.xcodeproj -scheme Scribe build CODE_SIGNING_ALLOWED=NO 2>&1 | tail -5
