@@ -2,6 +2,7 @@ import AppKit
 import CaptureKit
 import FusionKit
 import Persistence
+import ScratchpadKit
 import SessionKit
 import TranscribeKit
 import os
@@ -19,7 +20,9 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
     private let logger = Logger(subsystem: "com.example.scribe", category: "app")
 
     private var coordinator: SessionCoordinator!
+    private var composer: FragmentComposer!
     private var menuBarController: MenuBarController!
+    private var scratchpadPanel: ScratchpadPanelController!
     private var settingsWindowController: SettingsWindowController!
     private var hotkey: GlobalHotkey?
     private var eventTask: Task<Void, Never>?
@@ -78,6 +81,18 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
         menuBarController.onOpenSettings = { [weak settingsWindowController] in
             settingsWindowController?.show()
         }
+        // MARK: Scratchpad panel (SPEC §4.3 + §5).
+        // The composer is APP-OWNED; `attach` installs its persist/freeze
+        // callbacks on the coordinator (pending-row persistence lives there —
+        // the callbacks are coordinator-owned from here on). The panel only
+        // drives edit/newline/heartbeat and never touches the callbacks.
+        composer = FragmentComposer()
+        coordinator.attach(composer)
+        scratchpadPanel = ScratchpadPanelController(coordinator: coordinator, composer: composer)
+        menuBarController.onOpenScratchpad = { [weak scratchpadPanel] in
+            scratchpadPanel?.show()
+        }
+
         // History is T7; until then done-state clicks no-op (the closure
         // stays nil by design — MenuBarController treats nil as a no-op).
         // menuBarController.onOpenHistory = { sessionId in … }
@@ -85,7 +100,9 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
         // MARK: Global hotkey ⌥⌘N (SPEC §5: Carbon RegisterEventHotKey; no
         // NSEvent global monitors, no Accessibility permission).
         hotkey = GlobalHotkey()
-        // TODO(T6): hotkey?.onSummon = { [weak scratchpadPanel] in … toggle … }
+        hotkey?.onSummon = { [weak scratchpadPanel] in
+            scratchpadPanel?.toggle()
+        }
 
         // MARK: Coordinator events (app-level log; menu bar renders states,
         // History T7 will surface findings/failures/recovery in UI).

@@ -31,6 +31,11 @@ final class MenuBarController: NSObject {
 
     /// Open Settings… ⌘, — set by ScribeApp.
     var onOpenSettings: (() -> Void)?
+    /// Open the scratchpad panel — set by ScribeApp once the panel exists
+    /// (T6); setting it enables the menu item (disabled until wired).
+    var onOpenScratchpad: (() -> Void)? {
+        didSet { scratchpadItem?.isEnabled = onOpenScratchpad != nil }
+    }
     /// Open the History window at a session — wired when T7 lands; `nil`
     /// means done-state clicks no-op for now.
     var onOpenHistory: ((UUID) -> Void)?
@@ -40,6 +45,7 @@ final class MenuBarController: NSObject {
     private var menu: NSMenu!
     private var startStopItem: NSMenuItem!
     private var retryItem: NSMenuItem!
+    private var scratchpadItem: NSMenuItem!
 
     private var displayState: SessionDisplayState
     private var eventTask: Task<Void, Never>?
@@ -96,7 +102,8 @@ final class MenuBarController: NSObject {
         let scratchpad = NSMenuItem(title: "Open Scratchpad", action: #selector(openScratchpad), keyEquivalent: "n")
         scratchpad.keyEquivalentModifierMask = [.option, .command]
         scratchpad.target = self
-        scratchpad.isEnabled = false // TODO(T6): panel + summon wiring
+        scratchpad.isEnabled = false // enabled when ScribeApp wires onOpenScratchpad (T6)
+        scratchpadItem = scratchpad
 
         let history = NSMenuItem(title: "History…", action: #selector(openHistory), keyEquivalent: "")
         history.target = self
@@ -177,7 +184,7 @@ final class MenuBarController: NSObject {
     }
 
     @objc private func openScratchpad() {
-        // TODO(T6): summon ScratchpadPanel (same path as the ⌥⌘N hotkey).
+        onOpenScratchpad?() // panel show — same surface as the ⌥⌘N hotkey (T6)
     }
 
     @objc private func openHistory() {
