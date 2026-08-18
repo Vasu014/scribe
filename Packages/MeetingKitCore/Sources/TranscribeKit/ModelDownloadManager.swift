@@ -1,0 +1,96 @@
+import Foundation
+import WhisperKit
+
+/// Progress events for a first-launch model fetch (SPEC §4.2: "model
+/// download on first launch with progress UI").
+public enum ModelDownloadEvent: Sendable {
+    /// Fraction 0…1 (monotonic within a run).
+    case progress(Double)
+    /// Fetch finished; the URL is the local model folder — pass its `.path`
+    /// to `WhisperKitEngine(modelFolder:)`.
+    case completed(URL)
+    /// Fetch failed (network, storage, unknown variant).
+    case failed(String)
+}
+
+/// Best-effort model-fetch plumbing over WhisperKit's model management.
+/// Surface (name → progress stream → local path) is the stable contract for
+/// the setup wizard (T8); internals track whatever the resolved WhisperKit
+/// version offers. Resolved version 0.18.0 exposes
+/// `WhisperKit.download(variant:downloadBase:useBackgroundSession:
+/// progressCallback:)` returning the model folder URL, with progress via
+/// Foundation.`Progress` — mapped onto `ModelDownloadEvent` here. If a future
+/// version changes that API, only this file changes.
+///
+/// WhisperKit's Hub-backed fetch stores files under its own hub-cache layout
+/// inside `modelRoot` (e.g. `models--argmaxinc--whisperkit-coreml/snapshots/
+/// <hash>/openai_whisper-small.en`); the returned completion URL already
+/// points at the variant folder inside that layout, and re-running a fetch
+/// skips already-downloaded files, so `download` doubles as "ensure present".
+public struct ModelDownloadManager: Sendable {
+    /// `~/Library/Application Support/Scribe/models/` (SPEC §4.6 data home).
+    public static let defaultModelRoot = URL(
+        filePath: NSString(string: "~/Library/Application Support/Scribe/models")
+            .expandingTildeInPath
+    )
+
+    private let modelRoot: URL
+
+    public init(modelRoot: URL = ModelDownloadManager.defaultModelRoot) {
+        self.modelRoot = modelRoot
+    }
+
+    /// Where a variant's files live under our root (informational — the
+    /// hub-cache layout may add path components; use `isDownloaded(_:)` and
+    /// the `download` completion URL instead of constructing paths).
+    public func localFolder(forModelNamed name: String) -> URL {
+        modelRoot.appending(path: name)
+    }
+
+    /// Best-effort presence check: looks for a folder whose name contains the
+    /// variant name AND holds compiled Core ML model bundles. Heuristic —
+    /// the authoritative check is attempting `WhisperKitEngine` load.
+    public func isDownloaded(_ name: String) -> Bool {
+        guard let enumerator = FileManager.default.enumerator(
+            at: modelRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return false }
+        for case let url as URL in enumerator {
+            // A variant folder holds compiled Core ML bundles (*.mlmodelc);
+            // match a bundle whose parent folder is the named variant.
+            if url.lastPathComponent.hasSuffix(".mlmodelc") {
+                let parent = url.deletingLastPathComponent()
+                if parent.lastPathComponent.contains(name) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Fetches a named model variant, reporting 0–1 progress. The stream
+    /// finishes after `.completed` or `.failed`. Cancellation (stream
+    /// termination) cancels the fetch task.
+    public func download(_ name: String) -> AsyncStream<ModelDownloadEvent> {
+        AsyncStream { continuation in
+            let task = Task {
+                do {
+                    let folder = try await WhisperKit.download(
+                        variant: name,
+                        downloadBase: self.modelRoot,
+                        useBackgroundSession: false,
+                        progressCallback: { progress in
+                            continuation.yield(.progress(max(0, min(1, progress.fractionCompleted))))
+                        }
+                    )
+                    continuation.yield(.completed(folder))
+                } catch {
+                    continuation.yield(.failed(error.localizedDescription))
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}

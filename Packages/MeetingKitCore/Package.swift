@@ -3,8 +3,8 @@ import PackageDescription
 
 // MeetingKitCore — local SPM package (SPEC §3.1).
 // Module ownership mirrors the work split (§8).
-// WhisperKit is deliberately absent until Spike 2 (§7); TranscribeKit ships
-// the Transcriber seam + an unimplemented engine so UI work proceeds in parallel.
+// WhisperKit landed with T3 (SPEC §4.2): attached to TranscribeKit only —
+// every other module sees it through the Transcriber/WhisperEngine seams.
 let package = Package(
     name: "MeetingKitCore",
     platforms: [.macOS(.v14)],
@@ -19,6 +19,8 @@ let package = Package(
     dependencies: [
         // GRDB: decided in SPEC §4.6. Explicit schema control + migrations.
         .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
+        // WhisperKit: on-device speech-to-text engine (SPEC §4.2).
+        .package(url: "https://github.com/argmaxinc/WhisperKit", from: "0.9.0"),
     ],
     targets: [
         // Persistence is the cross-team contract (Spike 3, §7): everything
@@ -29,7 +31,13 @@ let package = Package(
         .testTarget(name: "PersistenceTests", dependencies: ["Persistence"]),
 
         .target(name: "CaptureKit", dependencies: ["Persistence"]),
-        .target(name: "TranscribeKit", dependencies: ["Persistence"]),
+        // TranscribeKit is the ONLY target that links WhisperKit (SPEC §4.2);
+        // the WhisperEngine seam keeps the rest of the package import-clean.
+        .target(name: "TranscribeKit", dependencies: [
+            "Persistence",
+            .product(name: "WhisperKit", package: "WhisperKit"),
+        ]),
+        .testTarget(name: "TranscribeKitTests", dependencies: ["TranscribeKit"]),
         .target(name: "ScratchpadKit", dependencies: ["Persistence"]),
         .target(name: "FusionKit", dependencies: ["Persistence"]),
         .testTarget(name: "FusionKitTests", dependencies: ["FusionKit"]),
