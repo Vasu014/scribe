@@ -31,6 +31,11 @@ let package = Package(
         .testTarget(name: "PersistenceTests", dependencies: ["Persistence"]),
 
         .target(name: "CaptureKit", dependencies: ["Persistence"]),
+        // CaptureKit unit tests cover the pure conversion math only (T4);
+        // the SCK/AVAE engine classes are hardware + TCC dependent and stay
+        // thin behind the CaptureEngine protocol (manual Spike-1 validation,
+        // docs/spikes/spike1.md).
+        .testTarget(name: "CaptureKitTests", dependencies: ["CaptureKit"]),
         // TranscribeKit is the ONLY target that links WhisperKit (SPEC §4.2);
         // the WhisperEngine seam keeps the rest of the package import-clean.
         .target(name: "TranscribeKit", dependencies: [
