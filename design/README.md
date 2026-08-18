@@ -35,21 +35,21 @@ Floating `NSPanel`, `.nonactivatingPanel` — floats above other windows, never 
 - **Body**: plain `NSTextView`, 13 pt system font, line-height 1.55, text `white 85%`; no formatting, no toolbar. Caret uses accent color.
 - **Empty state** (2a): placeholder at 32% white: "Jot a fragment — plain text, saved as you type".
 - **No-meeting state** (2a): header dot goes `white 25%` (static), label "No meeting" `white 50%`, Stop replaced by **Start Meeting** (white text on `#0A82FF`, hover `#2B93FF`); body hint: "Fragments typed here are discarded unless a meeting is recording."
-- **Saved tick** (2e): "Saved" 11 pt `white 45%` fades in ~1 s after typing pauses, fades out after 2 s. No spinner.
+- **Saved tick** (2e): pending-row pattern — the in-progress fragment persists as a mutable row on ~1 s debounce; a burst boundary (≥3 s pause / newline) freezes it. "Saved" 11 pt `white 45%` shows on persist, fades out after 2 s. No spinner.
 - Light variant (1c) exists if HUD reads too heavy: `rgba(248,248,247,.92)` material, hairline separators `black 8%`, bordered gray Stop button.
 
 ### 3. History window — designs 1d, 2d (empty)
 Standard titled window ~760×470. **Do not invest** — scheduled for deletion in Phase 3.
-- **Sidebar** (236 pt, source-list material ≈ `#F2F1EF`, hairline right border): session rows radius 6, padding 7×10; selected fill `black 7%`. Row: title 13 pt medium `#1D1D1F` (truncating) + right-aligned meta 11 pt `black 45%` (duration `42 min`, or spinner + "fusing", or "failed" in `#E0483E`); second line date 11 pt `black 45%`.
-- **Detail toolbar** (padding 12×16, hairline bottom): segmented control **Notes | Transcript** (12 pt; selected segment white pill with shadow) · spacer · bordered buttons **Export**, **Retry Fusion**, **Delete** (12 pt, radius 6, padding 3×10, 0.5 pt border `black 14%`; Delete text `#E0483E`).
-- **Notes pane** (padding 20/24): title 17 pt semibold; meta line 11.5 pt `black 45%` ("Today, 9:00–9:42 AM · fused from 3 fragments"); section labels 12 pt semibold uppercase `black 50%` tracking .05em ("SUMMARY", "ACTION ITEMS"); body 13 pt/1.55 `#333`; action items as checkbox rows (13 pt boxes, radius 4, 1.5 pt border `black 25%`). Rendered markdown; toggle to raw transcript.
+- **Sidebar** (236 pt, source-list material ≈ `#F2F1EF`, hairline right border): session rows radius 6, padding 7×10; selected fill `black 7%`. Row: title 13 pt medium `#1D1D1F` (truncating) + right-aligned meta 11 pt `black 45%` (duration `42 min`, or spinner + "fusing", or "failed" in `#E0483E`); crash-recovered sessions carry a small "recovered" tag capsule (9 pt, `systemYellow 22%` fill, `#8A6A00` text); second line date 11 pt `black 45%`.
+- **Detail toolbar** (padding 12×16, hairline bottom): segmented control **Notes | Transcript** (12 pt; selected segment white pill with shadow) · spacer · bordered buttons **Export**, **Retry Fusion**, **Export Eval Case**, **Delete** (12 pt, radius 6, padding 3×10, 0.5 pt border `black 14%`; Delete text `#E0483E`).
+- **Notes pane** (padding 20/24): title 17 pt semibold; meta line 11.5 pt `black 45%` ("Today, 9:00–9:42 AM · fused from 3 fragments"); section labels 12 pt semibold uppercase `black 50%` tracking .05em ("SUMMARY", "ACTION ITEMS"); body 13 pt/1.55 `#333`; action items as checkbox rows (13 pt boxes, radius 4, 1.5 pt border `black 25%`) — **static glyphs, not interactive**: v0 stores no action-item done-ness, and this surface must not grow into a todo widget. **Inline validator warnings** render in the notes flow: `systemYellow 12%` fill card, radius 7, 0.5 pt border, ⚠ glyph + 12 pt text, e.g. `Validator: "by Thursday" has no matching span in the transcript — verify before sending.` This is the hallucination-audit surface. Rendered markdown; toggle to raw transcript.
 - **Empty state** (2d): centered — gray waveform glyph, "No sessions yet" 14 pt semibold `black 65%`, caption 12 pt `black 40%` "Start a meeting from the menu bar. Notes land here when fusion finishes.", bordered **Start Meeting** button.
 
 ### 4. Settings window — design 1e
 Single pane, ~520 pt wide, System Settings grouped-row style: window bg `#F5F4F2`, groups are white cards radius 9, 0.5 pt border `black 10%`, rows padded 11 pt vertically with hairline separators inside a group. Labels 13 pt; captions 11 pt `black 45%`.
 1. **Anthropic API Key** — caption "Stored in the macOS Keychain". Display masked (`••••••••••7f2a`, monospace); edit-in-place secure field. Store in Keychain, never plist.
-2. **Whisper Model** — popup button (`large-v3-turbo`, …).
-3. **Lookback Window** — caption "Advanced — audio kept before a fragment"; popup (`90 seconds`).
+2. **Whisper Model** — popup button. Default `small.en`; options `tiny.en` / `base.en` / `small.en` / `large-v3-turbo` (flag the last as a large download). User setting, not build-time.
+3. **Lookback Window** — caption "Advanced — how far back fusion anchors a fragment in the transcript"; popup (`20 seconds`, the v0 default). Fusion-time transcript-anchoring only — raw audio is never retained.
 4. **Launch at Login** — standard switch (`systemGreen` on).
 
 ## Interactions & Behavior
@@ -58,12 +58,12 @@ Single pane, ~520 pt wide, System Settings grouped-row style: window bg `#F5F4F2
 - **Rec dot pulse**: 1.6 s ease-in-out opacity cycle; never hidden while capturing, including when the panel is closed.
 - **Stop flow**: stop → spinner (fusing, ~20 s typical) → "Notes ready" transient (4 s) or persistent ⚠ on failure.
 - Menu-item hover/selection: standard NSMenu behavior (accent-colored highlight).
-- Fragments autosave as typed (debounced ~1 s); the Saved tick is the only feedback.
+- Fragment persistence: mutable pending row updated on ~1 s debounce; burst boundary (≥3 s pause / newline) freezes it into a committed fragment. The Saved tick is the only feedback and fires on actual persist.
 
 ## State Management
 - App state machine: `idle → recording → processing → (done | failed)`; `done` auto-returns to `idle` after 4 s.
 - Recording: elapsed timer (1 s tick), fragment buffer (append-only, timestamped).
-- History: session list `{title, date, duration, state: fused|fusing|failed}`; per-session notes markdown + raw transcript.
+- History: session list `{title, date, duration, state: fused|fusing|failed, recovered: bool}`; per-session notes markdown + raw transcript.
 - Settings: apiKey (Keychain), whisperModel, lookbackSeconds, launchAtLogin.
 
 ## Design Tokens

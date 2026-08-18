@@ -122,7 +122,7 @@
     <div style="font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.08em;color:rgba(0,0,0,.45)">MOTION &amp; INTERACTION SPEC</div>
     <div style="display:flex;gap:10px"><span style="width:96px;flex:none;color:rgba(0,0,0,.45)">Panel summon</span><span>180 ms ease-out, opacity + scale .96→1; dismiss 140 ms. Reduce Motion → fade only.</span></div>
     <div style="display:flex;gap:10px"><span style="width:96px;flex:none;color:rgba(0,0,0,.45)">Rec dot</span><span>1.6 s opacity pulse. Never hidden while capturing, incl. panel closed.</span></div>
-    <div style="display:flex;gap:10px"><span style="width:96px;flex:none;color:rgba(0,0,0,.45)">Saved tick</span><span>"Saved" fades in 1 s after typing pauses, out after 2 s. No spinner.</span></div>
+    <div style="display:flex;gap:10px"><span style="width:96px;flex:none;color:rgba(0,0,0,.45)">Saved tick</span><span>In-progress fragment persists as a mutable row on ~1 s debounce; a burst boundary (≥3 s pause / newline) freezes it. Tick shows on persist, fades out after 2 s. No spinner.</span></div>
     <div style="display:flex;gap:10px"><span style="width:96px;flex:none;color:rgba(0,0,0,.45)">Notes ready</span><span>Checkmark pops (400 ms spring), holds 4 s, reverts to idle glyph.</span></div>
     <div style="display:flex;gap:10px"><span style="width:96px;flex:none;color:rgba(0,0,0,.45)">Esc</span><span>Dismisses panel; recording continues (dot stays in menu bar).</span></div>
   </div>
@@ -231,7 +231,7 @@
         <div style="font:400 11px -apple-system,sans-serif;color:rgba(0,0,0,.45);margin-top:1px">Yesterday, 2:30 PM</div>
       </div>
       <div style="border-radius:6px;padding:7px 10px">
-        <div style="display:flex;align-items:baseline;gap:6px"><span style="flex:1;font:500 13px -apple-system,sans-serif;color:#1d1d1f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">1:1 with Priya</span><span style="font:400 11px -apple-system,sans-serif;color:rgba(0,0,0,.45)">28 min</span></div>
+        <div style="display:flex;align-items:baseline;gap:6px"><span style="flex:1;font:500 13px -apple-system,sans-serif;color:#1d1d1f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">1:1 with Priya</span><span style="font:500 9px -apple-system,sans-serif;color:#8a6a00;background:rgba(255,204,0,.22);border-radius:4px;padding:1.5px 5px;letter-spacing:.02em">recovered</span><span style="font:400 11px -apple-system,sans-serif;color:rgba(0,0,0,.45)">28 min</span></div>
         <div style="font:400 11px -apple-system,sans-serif;color:rgba(0,0,0,.45);margin-top:1px">Yesterday, 11:00 AM</div>
       </div>
       <div style="border-radius:6px;padding:7px 10px">
@@ -250,6 +250,7 @@
       <span style="flex:1"></span>
       <span style="font:400 12px -apple-system,sans-serif;color:rgba(0,0,0,.65);border:0.5px solid rgba(0,0,0,.14);border-radius:6px;padding:3px 10px;background:#fff" style-hover="background:rgba(0,0,0,.04)">Export</span>
       <span style="font:400 12px -apple-system,sans-serif;color:rgba(0,0,0,.65);border:0.5px solid rgba(0,0,0,.14);border-radius:6px;padding:3px 10px;background:#fff" style-hover="background:rgba(0,0,0,.04)">Retry Fusion</span>
+      <span style="font:400 12px -apple-system,sans-serif;color:rgba(0,0,0,.65);border:0.5px solid rgba(0,0,0,.14);border-radius:6px;padding:3px 10px;background:#fff;white-space:nowrap" style-hover="background:rgba(0,0,0,.04)">Export Eval Case</span>
       <span style="font:400 12px -apple-system,sans-serif;color:#e0483e;border:0.5px solid rgba(0,0,0,.14);border-radius:6px;padding:3px 10px;background:#fff" style-hover="background:rgba(224,72,62,.06)">Delete</span>
     </div>
     <div style="padding:20px 24px 26px;overflow:hidden">
@@ -257,6 +258,10 @@
       <div style="font:400 11.5px -apple-system,sans-serif;color:rgba(0,0,0,.45);margin:3px 0 14px">Today, 9:00–9:42 AM · fused from 3 fragments</div>
       <div style="font:600 12px -apple-system,sans-serif;color:rgba(0,0,0,.5);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Summary</div>
       <div style="font:400 13px/1.55 -apple-system,sans-serif;color:#333;text-wrap:pretty">Renewal is likely but blocked on pricing. Dan pushed back on the per-seat increase; open to annual prepay at the current rate. Security review is done — only the DPA remains.</div>
+      <div style="display:flex;gap:8px;align-items:flex-start;margin-top:10px;padding:8px 10px;border-radius:7px;background:rgba(255,204,0,.12);border:0.5px solid rgba(178,134,0,.25)">
+        <svg width="13" height="12" viewBox="0 0 13 12" style="flex:none;margin-top:2px"><path d="M6.5 1 12 11H1L6.5 1Z" fill="#e6a700"></path><rect x="5.9" y="4.4" width="1.2" height="3.2" rx="0.6" fill="#fff"></rect><circle cx="6.5" cy="9" r="0.75" fill="#fff"></circle></svg>
+        <div style="font:400 12px/1.5 -apple-system,sans-serif;color:rgba(0,0,0,.65)"><span style="font-weight:600;color:rgba(0,0,0,.75)">Validator:</span> "by Thursday" has no matching span in the transcript — verify before sending.</div>
+      </div>
       <div style="font:600 12px -apple-system,sans-serif;color:rgba(0,0,0,.5);text-transform:uppercase;letter-spacing:.05em;margin:16px 0 6px">Action items</div>
       <div style="display:flex;flex-direction:column;gap:5px;font:400 13px/1.45 -apple-system,sans-serif;color:#333">
         <div style="display:flex;gap:8px"><span style="width:13px;height:13px;border-radius:4px;border:1.5px solid rgba(0,0,0,.25);margin-top:2px;flex:none"></span>Send annual-prepay quote to Dan by Thursday</div>
@@ -284,11 +289,11 @@
     <div style="background:#fff;border:0.5px solid rgba(0,0,0,.1);border-radius:9px;padding:0 14px">
       <div style="display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:0.5px solid rgba(0,0,0,.08)">
         <div style="flex:1;font:400 13px -apple-system,sans-serif;color:#1d1d1f">Whisper Model</div>
-        <span style="display:inline-flex;align-items:center;gap:6px;font:400 13px -apple-system,sans-serif;color:#1d1d1f;background:#fff;border:0.5px solid rgba(0,0,0,.16);border-radius:6px;padding:3px 10px;box-shadow:0 1px 1.5px rgba(0,0,0,.08)">large-v3-turbo<svg width="8" height="10" viewBox="0 0 8 10"><path d="M1.5 3.5 4 1l2.5 2.5M1.5 6.5 4 9l2.5-2.5" stroke="rgba(0,0,0,.5)" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"></path></svg></span>
+        <span style="display:inline-flex;align-items:center;gap:6px;font:400 13px -apple-system,sans-serif;color:#1d1d1f;background:#fff;border:0.5px solid rgba(0,0,0,.16);border-radius:6px;padding:3px 10px;box-shadow:0 1px 1.5px rgba(0,0,0,.08)">small.en<svg width="8" height="10" viewBox="0 0 8 10"><path d="M1.5 3.5 4 1l2.5 2.5M1.5 6.5 4 9l2.5-2.5" stroke="rgba(0,0,0,.5)" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"></path></svg></span>
       </div>
       <div style="display:flex;align-items:center;gap:12px;padding:11px 0">
-        <div style="flex:1"><div style="font:400 13px -apple-system,sans-serif;color:#1d1d1f">Lookback Window</div><div style="font:400 11px -apple-system,sans-serif;color:rgba(0,0,0,.45);margin-top:1px">Advanced — audio kept before a fragment</div></div>
-        <span style="display:inline-flex;align-items:center;gap:6px;font:400 13px -apple-system,sans-serif;color:#1d1d1f;background:#fff;border:0.5px solid rgba(0,0,0,.16);border-radius:6px;padding:3px 10px;box-shadow:0 1px 1.5px rgba(0,0,0,.08);white-space:nowrap;flex:none">90 seconds<svg width="8" height="10" viewBox="0 0 8 10"><path d="M1.5 3.5 4 1l2.5 2.5M1.5 6.5 4 9l2.5-2.5" stroke="rgba(0,0,0,.5)" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"></path></svg></span>
+        <div style="flex:1"><div style="font:400 13px -apple-system,sans-serif;color:#1d1d1f">Lookback Window</div><div style="font:400 11px -apple-system,sans-serif;color:rgba(0,0,0,.45);margin-top:1px">Advanced — how far back fusion anchors a fragment in the transcript</div></div>
+        <span style="display:inline-flex;align-items:center;gap:6px;font:400 13px -apple-system,sans-serif;color:#1d1d1f;background:#fff;border:0.5px solid rgba(0,0,0,.16);border-radius:6px;padding:3px 10px;box-shadow:0 1px 1.5px rgba(0,0,0,.08);white-space:nowrap;flex:none">20 seconds<svg width="8" height="10" viewBox="0 0 8 10"><path d="M1.5 3.5 4 1l2.5 2.5M1.5 6.5 4 9l2.5-2.5" stroke="rgba(0,0,0,.5)" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"></path></svg></span>
       </div>
     </div>
     <div style="background:#fff;border:0.5px solid rgba(0,0,0,.1);border-radius:9px;padding:0 14px">
