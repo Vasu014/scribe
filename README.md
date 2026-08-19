@@ -8,6 +8,12 @@ It does not join your meetings as a bot, does not upload audio, and never
 writes audio to disk. The only thing that leaves your machine is the text sent
 to the Anthropic API at the end of a meeting, using your own API key.
 
+![The Scribe status item in its five states](docs/screenshots/menu-bar-states.png)
+
+*The whole app lives in one menu bar item: idle, recording with the elapsed
+clock, fusing, notes ready, failed. The status-item artwork is the app's own,
+drawn onto a stand-in menu bar strip; the clock is macOS's.*
+
 **Status: Phase 0 dogfood.** Feature-complete v0, in daily-driver testing. Not
 yet signed or notarized — `scripts/release.sh` has the pipeline ready for
 signing week. Expect rough edges; see [Known limitations](#known-limitations).
@@ -34,12 +40,24 @@ While the meeting runs you can jot rough notes in a floating scratchpad
 (⌥⌘N). Each note is timestamped against the meeting clock, so fusion knows
 *when* you wrote it and can anchor it to what was being discussed.
 
+![The scratchpad panel floating over a fullscreen app while a meeting records](docs/screenshots/scratchpad.png)
+
+*The scratchpad while a meeting runs — plain text, no formatting, saved as you
+type. It floats above whatever you are doing and never takes focus from your
+meeting app.*
+
 When you stop, the transcript and your fragments go to Claude, which returns a
 title, a summary, decisions and action items — each **required to cite a
 timestamp and a verbatim quote**. A deterministic validator then re-checks
 every citation against the real transcript and flags any quote it cannot find.
 That warning card is the hallucination-audit surface: fusion is not trusted, it
 is checked.
+
+![A fused note in the History window, with a validator warning card above the action items](docs/screenshots/history-notes.png)
+
+*The result, in History. Every action item carries a timestamp and a verbatim
+quote — and the yellow card is the validator saying it could not find one of
+those quotes anywhere in the transcript.*
 
 ---
 
@@ -116,6 +134,11 @@ it to jump to the scratchpad, drag it along the top edge to move it. The
 recording indicator is never absent while the mic is live — that is a
 deliberate consent guarantee, not a convenience.
 
+![The recording chip in the top-right corner of a fullscreen app, hovered, showing a Stop button](docs/screenshots/recording-chip.png)
+
+*The chip in a fullscreen space, where there is no menu bar to fall back on.
+Hovering it reveals Stop.*
+
 After you stop: a spinner while fusion runs (~20 s), then a green **Notes
 ready** badge for 4 seconds. Click it to open the notes. On failure you get a
 ⚠ that persists until you open the menu, and **Retry Fusion** — your transcript
@@ -133,6 +156,11 @@ and notes are already saved, so a retry costs nothing but the API call.
 - **Lookback Window** — how far back fusion anchors a fragment in the
   transcript. Anchoring only; raw audio is never retained.
 - **Launch at Login**
+
+![The Scribe settings window](docs/screenshots/settings.png)
+
+*Four settings and nothing else. The API key is shown masked once set — it is
+read from the Keychain, never stored in a plist.*
 
 ---
 
