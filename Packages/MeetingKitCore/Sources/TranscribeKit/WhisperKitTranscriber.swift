@@ -401,7 +401,8 @@ actor ChannelWorker {
         guard !text.isEmpty else {
             Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").error("""
             Decode produced EMPTY text [\(String(describing: self.channel), privacy: .public)] \
-            from \(hypotheses.count, privacy: .public) hypothes(es) — all stripped to nothing.
+            from \(hypotheses.count, privacy: .public) hypothes(es). \
+            RAW (pre-strip): \(hypotheses.map(\.text).joined(separator: " | "), privacy: .public)
             """)
             return
         }

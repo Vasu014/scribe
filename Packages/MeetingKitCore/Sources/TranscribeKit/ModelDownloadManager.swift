@@ -61,7 +61,7 @@ public struct ModelDownloadManager: Sendable {
             // match a bundle whose parent folder is the named variant.
             if url.lastPathComponent.hasSuffix(".mlmodelc") {
                 let parent = url.deletingLastPathComponent()
-                if parent.lastPathComponent.contains(name) {
+                if parent.lastPathComponent.contains(name), Self.hasWeights(url) {
                     return true
                 }
             }
@@ -69,10 +69,38 @@ public struct ModelDownloadManager: Sendable {
         return false
     }
 
+    /// A `.mlmodelc` bundle is only usable once its WEIGHTS are present.
+    /// An interrupted fetch leaves the directory tree and the small metadata
+    /// files behind, so "the folder exists and contains .mlmodelc bundles" is
+    /// satisfied by a download that never finished: a real case left 9.7 MB of
+    /// an 889 MB model on disk, reported "Downloaded · applies next session",
+    /// and then failed to load at session start — producing an empty
+    /// transcript with no error, the failure this check exists to prevent.
+    private static func hasWeights(_ bundle: URL) -> Bool {
+        let weights = bundle.appending(path: "weights")
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: weights, includingPropertiesForKeys: [.fileSizeKey]
+        ), !contents.isEmpty else { return false }
+        // Any non-trivial weight blob is enough; a stub/partial file is not.
+        return contents.contains { url in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return size > 1_000_000
+        }
+    }
+
     /// Fetches a named model variant, reporting 0–1 progress. The stream
     /// finishes after `.completed` or `.failed`. Cancellation (stream
     /// termination) cancels the fetch task.
-    public func download(_ name: String) -> AsyncStream<ModelDownloadEvent> {
+    /// Hugging Face repo a variant is fetched from. Defaults to Argmax's
+    /// WhisperKit catalogue; a fine-tune (e.g. the Hinglish model) lives in
+    /// someone else's repo, so this has to be per-variant rather than a
+    /// constant.
+    public static let defaultRepo = "argmaxinc/whisperkit-coreml"
+
+    public func download(
+        _ name: String,
+        repo: String = ModelDownloadManager.defaultRepo
+    ) -> AsyncStream<ModelDownloadEvent> {
         AsyncStream { continuation in
             let task = Task {
                 do {
@@ -80,6 +108,7 @@ public struct ModelDownloadManager: Sendable {
                         variant: name,
                         downloadBase: self.modelRoot,
                         useBackgroundSession: false,
+                        from: repo,
                         progressCallback: { progress in
                             continuation.yield(.progress(max(0, min(1, progress.fractionCompleted))))
                         }

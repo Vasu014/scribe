@@ -323,12 +323,18 @@ private actor Resolver {
             """)
             return nil
         }
+        // Log the ATTEMPT, not just success: first load of a large model
+        // compiles it for the Neural Engine and can take minutes, during which
+        // there was previously no log at all — the session simply drained,
+        // timed out and reported an empty transcript with nothing to explain it.
+        logger.info("Loading WhisperKit model '\(variant, privacy: .public)' — first load of a large model compiles it and can take minutes.")
+        let loadStart = Date()
         do {
             let engine = try await WhisperKitEngine(
                 modelName: variant,
                 modelFolder: WhisperModelLocator.modelFolderArgument(folder)
             )
-            logger.info("WhisperKit engine loaded for '\(variant, privacy: .public)' (lazy, first session start).")
+            logger.info("WhisperKit engine loaded for '\(variant, privacy: .public)' in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)), privacy: .public)s.")
             return (variant, SharedInferenceGate(engine: engine))
         } catch {
             logger.error("""

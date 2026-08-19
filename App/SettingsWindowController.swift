@@ -46,7 +46,70 @@ enum WhisperModelOption: CaseIterable {
     case tinyEN
     case baseEN
     case smallEN
+    // Multilingual variants. The `.en` models above are English-ONLY: they
+    // are trained on English audio and will garble or force-translate any
+    // other language, silently and confidently. Any meeting that is not
+    // wholly in English needs one of these.
+    case small
     case largeV3Turbo
+    /// Hindi→Hinglish fine-tune (Oriserve, CoreML-converted by a third party).
+    /// Transcribes Hindi speech as ROMANIZED Hinglish, not Devanagari — the
+    /// right choice for Hindi/English code-switched meetings, the wrong one if
+    /// you want Devanagari output. Lives in a different HF repo from every
+    /// other variant, which is why `repo` exists on the download path.
+    case hinglish
+    /// Hinglish LARGE — `Trelis/whisper-hinglish-preview` (Apache-2.0, a
+    /// whisper-large-v3 fine-tune for Hindi/English code-switched speech),
+    /// converted to Core ML float16 with Argmax's `whisperkittools`.
+    ///
+    /// FLOAT16 (the reference precision), never quantized: a quantized
+    /// third-party Hinglish build is what produced segments reading the
+    /// literal string `nan`, and the trade this app takes is a large model
+    /// that transcribes over a small one that does not.
+    ///
+    /// Output script differs from `.hinglish` above: this one writes Hindi in
+    /// DEVANAGARI and keeps English words in Latin inside the same sentence
+    /// ("नमस्ते team, आज का stand up…"), which is what its benchmarks are
+    /// measured on. Pick `.hinglish` if romanized Hindi is wanted instead.
+    ///
+    /// Converted locally with `whisperkittools`, with ONE deviation from a
+    /// stock run: the fine-tune adds a 51867th token (`<|mixedcode|>`, an
+    /// optional *prompt* marker) and WhisperKit picks its tokenizer purely
+    /// from the decoder's logits width — 51866 means large-v3, anything else
+    /// silently falls back to `openai/whisper-base`, whose special-token ids
+    /// are all shifted. The extra embedding row is dropped before conversion
+    /// so the decoder is exactly large-v3 shaped. WhisperKit never feeds or
+    /// emits that token, so nothing is lost.
+    case hinglishLarge
+    /// Hinglish LARGE, ROMANIZED — `Oriserve/Whisper-Hindi2Hinglish-Prime`
+    /// (Apache-2.0, a whisper-large-v3 fine-tune, the most-downloaded Hindi→
+    /// Hinglish model on the Hub), converted to Core ML float16 with Argmax's
+    /// `whisperkittools`.
+    ///
+    /// Same size class as `.hinglishLarge`; the difference is the OUTPUT
+    /// SCRIPT. This one writes Hindi in LATIN letters ("namaste team, aaj ka
+    /// stand up…") — romanized Hinglish is what the fine-tune is trained to
+    /// emit, and it is the reason this case exists, because `.hinglishLarge`
+    /// writes the same speech in Devanagari.
+    ///
+    /// FLOAT16, never quantized — same trade as `.hinglishLarge`, and here the
+    /// counter-example is direct: `.hinglish` above is a QUANTIZED conversion
+    /// of THIS SAME upstream model, and every segment it emits is the literal
+    /// string `nan`. The model is fine; that conversion is not.
+    ///
+    /// Nothing had to be reshaped for the conversion (unlike `.hinglishLarge`,
+    /// which needed a token row dropped): this fine-tune's vocab is already
+    /// 51866, i.e. exactly large-v3 shaped, so WhisperKit picks the large-v3
+    /// tokenizer from the decoder's logits width on its own.
+    ///
+    /// The `_fp16` suffix on the folder is load-bearing. `WhisperModelLocator`
+    /// finds a variant by `contains(variant)` and returns the FIRST match, so
+    /// a folder named for the bare model version would be a prefix of
+    /// `Oriserve_Whisper-Hindi2Hinglish-Prime_889MB` — the broken quantized
+    /// build in `.hinglish`, which is on disk right next to it — and the
+    /// selection would resolve to whichever the directory enumerator reached
+    /// first. The suffix makes neither name a substring of the other.
+    case hinglishLargeRomanized
 
     static let defaultsCase = WhisperModelOption.smallEN
 
@@ -67,14 +130,73 @@ enum WhisperModelOption: CaseIterable {
         case .tinyEN: "tiny.en"
         case .baseEN: "base.en"
         case .smallEN: "small.en"
+        case .small: "small"
         case .largeV3Turbo: "large-v3_turbo"
+        case .hinglish: "Oriserve_Whisper-Hindi2Hinglish-Prime_889MB"
+        // whisperkittools names the generated folder after the source repo
+        // with `/` → `_`; that folder name IS the variant WhisperKit globs for.
+        case .hinglishLarge: "Trelis_whisper-hinglish-preview"
+        // `_fp16` disambiguates this folder from the `_889MB` quantized build
+        // above; see the case comment. It is NOT a whisperkittools default —
+        // the conversion was run with `--repo-path-suffix fp16`.
+        case .hinglishLargeRomanized: "Oriserve_Whisper-Hindi2Hinglish-Prime_fp16"
         }
     }
 
     /// SPEC §4.2 flags this variant as a large download. The Settings popup
     /// lists the bare model names (design 1e's option list), so the flag is
     /// surfaced in the row's caption when this variant is selected.
-    var isLargeDownload: Bool { self == .largeV3Turbo }
+    var isLargeDownload: Bool {
+        self == .largeV3Turbo || self == .hinglish || self == .hinglishLarge
+            || self == .hinglishLargeRomanized
+    }
+
+    /// What the popup shows: language plus size class, never the raw
+    /// WhisperKit variant id (a 40-character folder name for a fine-tune).
+    var displayTitle: String {
+        switch self {
+        case .tinyEN: "English — Tiny"
+        case .baseEN: "English — Base"
+        case .smallEN: "English — Small"
+        case .small: "Multilingual — Small"
+        case .largeV3Turbo: "Multilingual — Large"
+        case .hinglish: "Hinglish — Small"
+        // Both large Hinglish builds are the same language and size class, so
+        // the script is the only thing that tells them apart in the popup —
+        // and it is the whole reason to pick one over the other.
+        case .hinglishLarge: "Hinglish — Large (Devanagari)"
+        case .hinglishLargeRomanized: "Hinglish — Large (romanized)"
+        }
+    }
+
+    /// Approximate download size, shown only while the model is missing —
+    /// the one moment the number is actionable.
+    var approximateSize: String {
+        switch self {
+        case .tinyEN: "75 MB"
+        case .baseEN: "145 MB"
+        case .smallEN, .small: "480 MB"
+        case .hinglish: "890 MB"
+        case .largeV3Turbo: "1.5 GB"
+        case .hinglishLarge: "2.9 GB"
+        case .hinglishLargeRomanized: "2.9 GB"
+        }
+    }
+
+    /// Hugging Face repo holding this variant. Fine-tunes are not in Argmax's
+    /// catalogue, so the repo travels with the variant.
+    var repo: String {
+        switch self {
+        case .hinglish: "nitinh/whisperkit-hinglish-coreml"
+        // Generated locally by `whisperkittools`; this is where the build is
+        // to be published so other installs can fetch it. Nothing else in the
+        // app reads `repo` when the variant is already on disk.
+        case .hinglishLarge: "vbhar/whisperkit-hinglish-large-v3-coreml"
+        case .hinglishLargeRomanized: "vbhar/whisperkit-hindi2hinglish-prime-coreml"
+        default: ModelDownloadManager.defaultRepo
+        }
+    }
+
 
     /// The SPEC §4.2 spelling of a variant, still accepted so a value
     /// persisted before the id above was corrected resolves to its option
@@ -640,7 +762,7 @@ final class SettingsWindowController: NSObject {
     /// Design 1e groups these as two hairline-separated rows in ONE card.
     private func makeModelAndLookbackCard() -> NSView {
         modelPopup = NSPopUpButton()
-        modelPopup.addItems(withTitles: WhisperModelOption.allCases.map(\.name))
+        modelPopup.addItems(withTitles: WhisperModelOption.allCases.map(\.displayTitle))
         modelPopup.target = self
         modelPopup.action = #selector(modelChanged)
         modelPopup.setContentHuggingPriority(.defaultHigh, for: .horizontal)
@@ -707,7 +829,10 @@ final class SettingsWindowController: NSObject {
         // Inherits the main actor (this type is @MainActor), so the UI
         // updates below need no hop.
         modelDownloadTask = Task { [weak self] in
-            for await event in downloads.download(variant) {
+            // The repo travels with the variant: fine-tunes (Hinglish) are not in
+            // Argmax's catalogue, and fetching them from it 404s.
+            let repo = WhisperModelOption(named: variant)?.repo ?? ModelDownloadManager.defaultRepo
+            for await event in downloads.download(variant, repo: repo) {
                 guard let self, !Task.isCancelled else { return }
                 switch event {
                 case .progress(let fraction):
@@ -752,30 +877,33 @@ final class SettingsWindowController: NSObject {
         }
         // The large-download flag (SPEC §4.2) rides in the caption, not in
         // the popup title (design 1e lists bare model names).
-        let prefix = option.isLargeDownload ? "Large download · " : ""
+        // Language capability leads the caption: picking an English-only
+        // model for a non-English meeting fails SILENTLY (plausible nonsense,
+        // no error), so it has to be visible before recording, not after.
+        // The caption says only what the user must DO. Which languages a
+        // model handles is in its title; the download size matters only while
+        // it is missing. Everything else was jargon (variant ids, "Large
+        // download", the language arrow) that pushed the one actionable fact
+        // onto a third line.
         switch modelDownload {
         case .downloading(let variant, let fraction) where variant == option.name:
-            modelCaption.stringValue =
-                "\(prefix)Downloading… \(Int((fraction * 100).rounded())) %"
+            modelCaption.stringValue = "Downloading… \(Int((fraction * 100).rounded())) %"
             modelCaption.textColor = .secondaryLabelColor
             modelDownloadButton.isHidden = true
         case .failed(let variant, let message) where variant == option.name:
-            modelCaption.stringValue = "\(prefix)Download failed — \(message)"
+            modelCaption.stringValue = "Download failed — \(message)"
             modelCaption.textColor = .systemRed
             modelDownloadButton.isHidden = false
             modelDownloadButton.title = "Retry"
             modelDownloadButton.setAccessibilityLabel("Retry downloading the selected speech model")
         default:
-            // Presence on disk is the authority whenever this window is not
-            // mid-fetch (the wizard may have downloaded it, the user may have
-            // deleted it).
             if downloads.isDownloaded(option.name) {
-                modelCaption.stringValue = "\(prefix)Downloaded · applies next session"
+                modelCaption.stringValue = "Ready · applies at your next meeting"
                 modelCaption.textColor = .secondaryLabelColor
                 modelDownloadButton.isHidden = true
             } else {
                 modelCaption.stringValue =
-                    "\(prefix)Not downloaded — meetings will record but won’t be transcribed"
+                    "Not downloaded (\(option.approximateSize)) — meetings won’t be transcribed"
                 modelCaption.textColor = .systemRed
                 modelDownloadButton.isHidden = false
                 modelDownloadButton.title = "Download"

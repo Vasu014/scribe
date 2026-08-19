@@ -634,7 +634,10 @@ final class SetupWizardController: NSObject {
         updateModelStepUI()
         let downloads = self.downloads
         downloadTask = Task {
-            for await event in downloads.download(variant) {
+            // The repo travels with the variant: fine-tunes (Hinglish) are not in
+            // Argmax's catalogue, and fetching them from it 404s.
+            let repo = WhisperModelOption(named: variant)?.repo ?? ModelDownloadManager.defaultRepo
+            for await event in downloads.download(variant, repo: repo) {
                 handle(event)
             }
         }
