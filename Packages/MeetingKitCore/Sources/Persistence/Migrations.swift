@@ -59,6 +59,21 @@ public enum Migrations {
 
         // v2, v3, ... append below. Never edit a shipped migration.
 
+        /// Fusion failure reason on the session row (SPEC §4.5 failure/retry
+        /// semantics). `processing` on its own is ambiguous — it covers both
+        /// "still fusing" and "failed, Retry available" — and the reason used
+        /// to live only in the History window's memory, so a relaunch turned a
+        /// permanently failed session into an eternal spinner. Both columns
+        /// are nullable and default to NULL, so existing rows migrate as "no
+        /// failure recorded", which is exactly what they mean.
+        migrator.registerMigration("v2") { db in
+            try db.alter(table: "sessions") { t in
+                t.add(column: "fusionErrorMessage", .text)
+                t.add(column: "fusionFailedAt", .datetime)
+            }
+            try db.execute(sql: "UPDATE meta SET schema_version = 2")
+        }
+
         return migrator
     }
 }

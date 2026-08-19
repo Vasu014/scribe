@@ -455,6 +455,79 @@ final class SessionCoordinatorTests: XCTestCase {
         ])
     }
 
+    // The state-loss bug: the failure REASON must land on the session row,
+    // not only on the event bus. A surface opened in a LATER launch has no
+    // event to have heard, and `processing` alone cannot distinguish "still
+    // fusing" from "failed permanently" — which is what rendered a dead
+    // session as an eternal spinner.
+    func testFusionFailurePersistsReasonOnTheSessionRow() async throws {
+        let store = try MeetingStore.inMemory()
+        let message = "No Anthropic API key is saved. Add one in Settings, then retry."
+        let fusion = MockFusionRunner(results: [.failure(.provider(message))], storingNotesIn: store)
+        let coordinator = makeCoordinator(store: store, transcriber: MockTranscriber(), fusion: fusion)
+
+        let session = try await coordinator.start()
+        await coordinator.stop()
+
+        let row = try XCTUnwrap(try store.session(id: session.id))
+        XCTAssertEqual(row.state, .processing, "SPEC §4.5: failure leaves the session in processing")
+        XCTAssertEqual(row.fusionErrorMessage, message, "the reason must survive this process")
+        XCTAssertNotNil(row.fusionFailedAt)
+    }
+
+    // A retry that succeeds must leave NO stale reason behind, or the fixed
+    // session keeps rendering as failed forever.
+    func testSuccessfulRetryClearsThePersistedFusionFailure() async throws {
+        let store = try MeetingStore.inMemory()
+        let fusion = MockFusionRunner(
+            results: [
+                .failure(.provider("network down")),
+                .success(noteId: UUID(), title: "Retry works"),
+            ],
+            storingNotesIn: store
+        )
+        let coordinator = makeCoordinator(store: store, transcriber: MockTranscriber(), fusion: fusion)
+
+        let session = try await coordinator.start()
+        await coordinator.stop()
+        XCTAssertEqual(try store.session(id: session.id)?.fusionErrorMessage, "network down")
+
+        await coordinator.retryFusion()
+
+        let retried = try XCTUnwrap(try store.session(id: session.id))
+        XCTAssertEqual(retried.state, .complete)
+        XCTAssertNil(retried.fusionErrorMessage, "a fixed session must stop showing the old error")
+        XCTAssertNil(retried.fusionFailedAt)
+    }
+
+    // Findings are NOT a failure — a note was stored (SPEC §4.5) — so a
+    // previous failure's reason must be cleared even though the row stays in
+    // `processing` with Retry available.
+    func testRetryStoringNoteWithFindingsClearsThePersistedFailure() async throws {
+        let store = try MeetingStore.inMemory()
+        let finding = NotesValidator.Finding(
+            kind: .missingTimestamp, detail: "cites 00:42, which is not in the transcript"
+        )
+        let fusion = MockFusionRunner(
+            results: [
+                .failure(.provider("the provider timed out")),
+                .storedWithFindings(noteId: UUID(), title: "Partly grounded", findings: [finding]),
+            ],
+            storingNotesIn: store
+        )
+        let coordinator = makeCoordinator(store: store, transcriber: MockTranscriber(), fusion: fusion)
+
+        let session = try await coordinator.start()
+        await coordinator.stop()
+        XCTAssertNotNil(try store.session(id: session.id)?.fusionErrorMessage)
+
+        await coordinator.retryFusion()
+
+        let retried = try XCTUnwrap(try store.session(id: session.id))
+        XCTAssertEqual(retried.state, .processing, "findings keep Retry available")
+        XCTAssertNil(retried.fusionErrorMessage)
+    }
+
     // Crash recovery (SPEC §4.4): a session stuck in .recording at init is
     // marked recovered → .processing, surfaced via event; NO auto-fusion.
     func testCrashRecoveryMarksRecoveredAndOffersFusionWithoutRunningIt() async throws {

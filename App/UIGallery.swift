@@ -415,7 +415,7 @@ private enum Fixtures {
     static let infraId = UUID(uuidString: "A0000000-0000-4000-8000-000000000004")!
 
     /// The `failed` row state is derived from `processing` + a
-    /// `fusionFailed` event (SPEC §5 — never persisted), so the gallery
+    /// `fusionFailed` event or the persisted column; the gallery
     /// hands History the same map the event handler would have built.
     static let fusionFailures: [UUID: String] = [
         infraId: "The Anthropic API returned 529 (overloaded).",

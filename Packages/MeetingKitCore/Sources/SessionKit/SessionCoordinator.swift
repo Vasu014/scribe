@@ -413,6 +413,15 @@ public final class SessionCoordinator: @unchecked Sendable {
         guard admitFusion(for: row.id) else { return }
         defer { releaseFusion(for: row.id) }
 
+        // A retry is now genuinely in progress, so the stored failure reason
+        // (SPEC §4.5) stops being true the moment the run is admitted: clear
+        // it here and History's row flips from "failed" back to "fusing"
+        // wherever it reads the store. `apply` re-records it if this attempt
+        // fails too. Cleared only AFTER `admitFusion` — a click that loses
+        // the in-flight guard is a no-op and must not wipe the reason the
+        // still-running attempt will re-report.
+        try? store.clearFusionFailure(sessionId: row.id)
+
         if resolved.drivesDisplay {
             // Entry-time resolution is correct HERE: this fires before the
             // await, while `resolved` is still true.
@@ -624,6 +633,14 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// `drivesDisplay` (the session is the coordinator's current one);
     /// session-scoped events (findings, failure) are emitted regardless so
     /// History surfaces them.
+    ///
+    /// The failure REASON is written to the session row here as well as
+    /// emitted (`SessionRecord.fusionErrorMessage`, schema v2). The event is
+    /// the immediate path for a surface that is already listening; the column
+    /// is what a surface opened in a LATER launch reads, so a permanently
+    /// failed session still says why instead of spinning forever. Both the
+    /// write and the clear are outside the `drivesDisplay` guard: the row is
+    /// session-scoped truth, not menu-bar display state.
     private func apply(_ outcome: FusionRunOutcome, to session: SessionRecord, drivesDisplay: Bool) {
         let fresh = (try? store.session(id: session.id)) ?? session
         switch outcome {
@@ -631,6 +648,8 @@ public final class SessionCoordinator: @unchecked Sendable {
             var row = fresh
             row.state = .complete
             if row.title == nil { row.title = title }
+            row.fusionErrorMessage = nil // this attempt worked (SPEC §4.5 Retry)
+            row.fusionFailedAt = nil
             try? store.updateSession(row)
             if drivesDisplay {
                 withLock { lastFusionErrorStorage = nil }
@@ -641,6 +660,8 @@ public final class SessionCoordinator: @unchecked Sendable {
             var row = fresh
             row.state = .processing // Retry stays available (SPEC §4.5)
             if row.title == nil { row.title = title }
+            row.fusionErrorMessage = nil // a note WAS stored — findings are not a failure
+            row.fusionFailedAt = nil
             try? store.updateSession(row)
             if drivesDisplay {
                 withLock { lastFusionErrorStorage = nil }
@@ -650,6 +671,9 @@ public final class SessionCoordinator: @unchecked Sendable {
 
         case let .failure(error):
             let message = Self.describe(error)
+            // Row stays `processing` (SPEC §4.5); the reason is what makes
+            // that state readable as "failed, Retry available".
+            try? store.recordFusionFailure(sessionId: session.id, message: message)
             if drivesDisplay {
                 withLock { lastFusionErrorStorage = message }
                 setDisplay(.failed(sessionId: session.id))

@@ -57,6 +57,20 @@ public struct SessionRecord: Codable, Equatable, FetchableRecord, PersistableRec
     public var title: String?
     /// JSON-encoded [DeviceEvent]; opaque to the store, owned by CaptureKit/SessionKit.
     public var deviceEvents: String
+    /// Why the LAST fusion attempt failed (SPEC §4.5: failures leave the
+    /// session in `processing` with Retry), or `nil` when the last attempt
+    /// stored a note.
+    ///
+    /// Persisted (schema v2) because `processing` alone cannot tell a session
+    /// that is still fusing apart from one that failed permanently. Held only
+    /// in memory, the reason died with the process: after a relaunch a
+    /// failed session rendered as "fusing" with a live spinner forever, with
+    /// no error text and nothing to act on. Written by `SessionCoordinator`
+    /// when it applies a fusion outcome; cleared when a later attempt
+    /// succeeds, so a fixed session never shows a stale error.
+    public var fusionErrorMessage: String?
+    /// When `fusionErrorMessage` was recorded; `nil` whenever it is `nil`.
+    public var fusionFailedAt: Date?
 
     public init(
         id: UUID = UUID(),
@@ -65,7 +79,9 @@ public struct SessionRecord: Codable, Equatable, FetchableRecord, PersistableRec
         state: SessionState = .recording,
         recovered: Bool = false,
         title: String? = nil,
-        deviceEvents: String = "[]"
+        deviceEvents: String = "[]",
+        fusionErrorMessage: String? = nil,
+        fusionFailedAt: Date? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -74,6 +90,8 @@ public struct SessionRecord: Codable, Equatable, FetchableRecord, PersistableRec
         self.recovered = recovered
         self.title = title
         self.deviceEvents = deviceEvents
+        self.fusionErrorMessage = fusionErrorMessage
+        self.fusionFailedAt = fusionFailedAt
     }
 
     public var deviceEventList: [DeviceEvent] {

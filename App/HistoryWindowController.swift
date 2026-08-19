@@ -10,13 +10,16 @@ import os
 
 /// History window (SPEC §5; design/README "History window" + "Empty state",
 /// designs 1d/2d): 760×470 titled window, 236 pt source-list sidebar — rows
-/// show title (or date/duration fallback, SPEC §4.5), derived meta
-/// (`fused | fusing | failed`, SPEC §5 — derived at display time, never a
-/// schema column), date, and a "recovered" capsule (SPEC §4.4) — plus a
+/// show title (or "Untitled meeting"), derived meta (`fused | fusing |
+/// failed`, SPEC §5 — derived at display time from the storage state plus the
+/// last fusion outcome), date, and a "recovered" capsule (SPEC §4.4) — plus a
 /// detail pane with a **Notes | Transcript** toggle, rendered markdown with
 /// INLINE validator warning cards (SPEC §4.5 — the hallucination-audit
 /// surface; the validator is re-run on display, deterministic and cheap) and
 /// STATIC action-item checkbox glyphs (v0 stores no done-ness, SPEC §5).
+/// With no fused note the Notes face falls back to the user's own scratchpad
+/// fragments (see `scratchpadFallback`), so a failed session shows why it
+/// failed AND what the user wrote, with Retry still live.
 ///
 /// Actions (design 1d toolbar): **Export** markdown — notes + collapsible
 /// `<details>` transcript (SPEC §4.6 export); **Retry Fusion** — enabled for
@@ -97,11 +100,13 @@ final class HistoryWindowController: NSObject {
     /// Session ids with a canonical note (drives `fused` meta for
     /// `processing` rows — findings keep notes stored, SPEC §4.5).
     private var notePresence: Set<UUID> = []
-    /// In-memory fusion failures from `fusionFailed` events (SPEC §5: the
-    /// failed UI state is derived from `processing` + last error and is
-    /// deliberately NOT persisted; before the first failure event after a
-    /// relaunch, an interrupted session shows as "fusing" — documented v0
-    /// limitation, Retry Fusion is always available for `processing` rows).
+    /// Live fusion failures from `fusionFailed` events — the IMMEDIATE half
+    /// of the failed row state (SPEC §5: `processing` + last error).
+    ///
+    /// The durable half is `SessionRecord.fusionErrorMessage` (schema v2);
+    /// see `failureMessage(for:)`. This map used to be the ONLY half, which
+    /// is why a failed session came back from a relaunch as a permanent
+    /// "fusing" spinner with no reason attached.
     private var fusionFailures: [UUID: String] = [:]
     private var selectedSessionId: UUID?
     private var detail: SessionDetail?
@@ -180,11 +185,13 @@ final class HistoryWindowController: NSObject {
 
     /// Puts the window in a fixed, screenshot-able state without a live
     /// session. Needed because two inputs of this surface are not reachable
-    /// from the store: the Notes|Transcript segment (private control) and
-    /// `fusionFailures`, which SPEC §5 keeps IN MEMORY, fed only by
+    /// from the store as the gallery seeds it: the Notes|Transcript segment
+    /// (a private control) and the LIVE `fusionFailures` map, fed by
     /// `.fusionFailed` coordinator events that a fixture store can never
-    /// emit. Everything else — rows, meta, validator cards — still comes
-    /// from the real `reload()` path.
+    /// emit. (Failures are persisted too now — `failureMessage(for:)` — but
+    /// the map keeps the fixture independent of the seeded rows.) Everything
+    /// else — rows, meta, validator cards — still comes from the real
+    /// `reload()` path.
     func galleryConfigure(select sessionId: UUID?, tab: Int, failed: [UUID: String]) {
         fusionFailures = failed
         segmented.selectedSegment = tab
@@ -550,6 +557,19 @@ final class HistoryWindowController: NSObject {
         case recording, fused, fusing, failed
     }
 
+    /// Why the last fusion attempt failed, or `nil` if it did not.
+    ///
+    /// Two sources, in priority order: the live `fusionFailed` event for this
+    /// launch (immediate — it lands before the coordinator's store write is
+    /// visible to a reload already in flight), then the persisted column
+    /// (schema v2), which is what a session that failed in an EARLIER launch
+    /// has. Both are cleared by Retry, and the coordinator clears the column
+    /// whenever an attempt stores a note, so a value here always means "the
+    /// most recent attempt failed".
+    private func failureMessage(for session: SessionRecord) -> String? {
+        fusionFailures[session.id] ?? session.fusionErrorMessage
+    }
+
     private func rowState(_ session: SessionRecord) -> RowState {
         switch session.state {
         case .recording:
@@ -557,7 +577,7 @@ final class HistoryWindowController: NSObject {
         case .complete:
             return .fused
         case .processing:
-            if fusionFailures[session.id] != nil { return .failed } // SPEC §5: processing + last error
+            if failureMessage(for: session) != nil { return .failed } // SPEC §5: processing + last error
             return notePresence.contains(session.id) ? .fused : .fusing // findings keep a stored note
         }
     }
@@ -637,6 +657,11 @@ final class HistoryWindowController: NSObject {
             noteCreatedAt: note?.createdAt,
             segmentCount: segmentCount,
             fragmentCount: fragmentCount,
+            // A failure does not move `state` (it stays `processing`, SPEC
+            // §4.5), so without this the pane kept showing "Fusing…" after
+            // the failure landed — the key was unchanged and the render was
+            // skipped. Covers the clear on Retry too.
+            failure: failureMessage(for: session),
             mode: segmented.selectedSegment
         )
     }
@@ -695,6 +720,72 @@ final class HistoryWindowController: NSObject {
             out.append(body)
         } else {
             out.append(statusLine(for: detail))
+            // With no fused note this pane used to end at the status line,
+            // and the user's OWN typed fragments were displayed nowhere in
+            // the app — the Transcript face renders audio segments only. A
+            // meeting's worth of deliberate jotting could vanish behind a
+            // missing API key, which breaks the scratchpad's whole promise
+            // that typing is safe. They are shown verbatim, under their own
+            // heading, so they never read as model output; once fusion
+            // succeeds they are woven into the note and this block is gone.
+            out.append(scratchpadFallback(detail))
+        }
+        return out
+    }
+
+    /// The user's raw scratchpad fragments (SPEC §4.3), shown only when no
+    /// canonical note exists — see the call site. Anchor offsets are the
+    /// session-clock values the fragments were typed at, rendered with the
+    /// same formatter the transcript uses (FusionKit canonical rendering) so
+    /// the two faces line up.
+    private func scratchpadFallback(_ detail: SessionDetail) -> NSAttributedString {
+        guard !detail.fragments.isEmpty else { return NSAttributedString() }
+
+        let out = NSMutableAttributedString()
+
+        let labelParagraph = NSMutableParagraphStyle()
+        labelParagraph.paragraphSpacingBefore = 16 // design 1d section-label margin
+        out.append(NSAttributedString(string: "YOUR NOTES\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .kern: 0.6, // design 1d: .05em tracking on section labels
+            .paragraphStyle: labelParagraph,
+        ]))
+
+        let captionParagraph = NSMutableParagraphStyle()
+        captionParagraph.paragraphSpacing = 8
+        out.append(NSAttributedString(
+            string: "Typed by you during the meeting — shown as written, not fused.\n",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11.5),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: captionParagraph,
+            ]
+        ))
+
+        let bodyParagraph = NSMutableParagraphStyle()
+        bodyParagraph.lineHeightMultiple = 1.45
+        bodyParagraph.paragraphSpacing = 3
+        bodyParagraph.headIndent = 52 // wrapped lines clear the timestamp column
+        let stamp: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: bodyParagraph,
+        ]
+        let text: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: bodyParagraph,
+        ]
+        // Store order is anchor-ascending (SPEC §4.3), i.e. the order typed.
+        for fragment in detail.fragments {
+            out.append(NSAttributedString(
+                string: CanonicalRendering.timestamp(fragment.anchorOffset) + "  ", attributes: stamp
+            ))
+            out.append(NSAttributedString(
+                string: fragment.text.trimmingCharacters(in: .whitespacesAndNewlines) + "\n",
+                attributes: text
+            ))
         }
         return out
     }
@@ -712,7 +803,7 @@ final class HistoryWindowController: NSObject {
         case .processing:
             if detail.note != nil {
                 text += " · \(fragmentText)" // note stored; findings keep Retry (SPEC §4.5)
-            } else if fusionFailures[detail.session.id] != nil {
+            } else if failureMessage(for: detail.session) != nil {
                 text += " · fusion failed"
             } else {
                 text += " · fusing…"
@@ -775,7 +866,7 @@ final class HistoryWindowController: NSObject {
         case .recording:
             text = "Meeting in progress — notes appear here after fusion."
         case .processing:
-            if let message = fusionFailures[detail.session.id] {
+            if let message = failureMessage(for: detail.session) {
                 text = "Fusion failed: \(message) Use Retry Fusion to try again."
             } else {
                 text = "Fusing transcript and fragments — notes will appear here shortly."
@@ -862,7 +953,12 @@ final class HistoryWindowController: NSObject {
     /// session; the row flips back to "fusing" immediately.
     @objc private func retryTapped() {
         guard let session = detail?.session, session.state == .processing else { return }
+        // Both halves of the failure state (see `failureMessage(for:)`). The
+        // stored one is cleared here as well as by the coordinator so the row
+        // flips to "fusing" on THIS reload, rather than a beat later when the
+        // async retry gets going.
         fusionFailures[session.id] = nil
+        try? store.clearFusionFailure(sessionId: session.id)
         Task { await coordinator.retryFusion(for: session) }
         reload()
     }
@@ -1213,7 +1309,12 @@ extension HistoryWindowController: NSTableViewDataSource, NSTableViewDelegate {
             metaColor = HistoryMeta.failureColor // design: #E0483E
         }
         cell.configure(
-            title: session.title?.isEmpty == false ? session.title! : HistoryMeta.fallbackTitle(session),
+            // NOT `fallbackTitle` (date · duration): this row already prints
+            // the date on line 2 and the duration in its own meta column, so
+            // the SPEC §4.5 fallback rendered as "Today, 8:30 AM · 1 min"
+            // stacked directly on top of "Today, 8:30 AM". The detail pane,
+            // which has no such columns, still uses the spec'd form.
+            title: session.title?.isEmpty == false ? session.title! : HistoryMeta.untitledRowTitle,
             dateText: HistoryMeta.dateAndTime(session.startedAt),
             meta: meta,
             metaColor: metaColor,
@@ -1289,6 +1390,7 @@ private struct DetailKey: Equatable {
     let noteCreatedAt: Date?
     let segmentCount: Int
     let fragmentCount: Int
+    let failure: String?
     let mode: Int
 }
 
@@ -1631,8 +1733,16 @@ private enum HistoryMeta {
         return "\(minutes) min"
     }
 
-    /// Untitled-session fallback (SPEC §4.5): date/duration. Recovered
-    /// sessions keep a nil `endedAt` (SPEC §4.4) → date only.
+    /// Sidebar title for a session fusion never named. The row carries the
+    /// date and the duration in dedicated slots already, so the date/duration
+    /// `fallbackTitle` only duplicated them; this states the one thing the
+    /// row cannot otherwise say.
+    static let untitledRowTitle = "Untitled meeting"
+
+    /// Untitled-session fallback (SPEC §4.5): date/duration. Used where there
+    /// is no separate date line to duplicate — the detail pane heading, the
+    /// delete confirmation, and export filenames. Recovered sessions keep a
+    /// nil `endedAt` (SPEC §4.4) → date only.
     static func fallbackTitle(_ session: SessionRecord) -> String {
         if let ended = session.endedAt {
             return "\(dateAndTime(session.startedAt)) · \(duration(ended.timeIntervalSince(session.startedAt)))"

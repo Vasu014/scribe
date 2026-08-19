@@ -1,3 +1,4 @@
+import GRDB
 import XCTest
 @testable import Persistence
 
@@ -9,9 +10,113 @@ final class PersistenceTests: XCTestCase {
 
     // MARK: Schema
 
-    func testSchemaVersionIsOne() throws {
+    func testSchemaVersionIsTwo() throws {
         let store = try makeStore()
-        XCTAssertEqual(try store.schemaVersion, 1)
+        XCTAssertEqual(try store.schemaVersion, 2)
+    }
+
+    /// The v2 migration must run on a store created at v1 and leave every
+    /// existing row intact, with the new columns reading as "no failure".
+    /// This is the shape of the owner's real store on disk.
+    func testV2MigrationIsAdditiveOnAnExistingV1Store() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scribe-migration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("store.sqlite").path
+
+        // A v1 store, built with ONLY the v1 migration — no new columns.
+        let sessionId = UUID()
+        do {
+            let queue = try DatabaseQueue(path: path)
+            try Migrations.migrator.migrate(queue, upTo: "v1")
+            try queue.write { db in
+                try db.execute(
+                    sql: """
+                        INSERT INTO sessions (id, startedAt, endedAt, state, recovered, title, deviceEvents)
+                        VALUES (?, ?, ?, 'processing', 0, NULL, '[]')
+                        """,
+                    arguments: [sessionId, Date(timeIntervalSince1970: 1_000), Date(timeIntervalSince1970: 1_060)]
+                )
+            }
+        }
+
+        // Reopening through MeetingStore runs v2 against the populated file.
+        let migrated = try MeetingStore(path: path)
+        XCTAssertEqual(try migrated.schemaVersion, 2)
+        let row = try XCTUnwrap(try migrated.session(id: sessionId))
+        XCTAssertEqual(row.state, .processing, "pre-existing row survives the migration")
+        XCTAssertNil(row.fusionErrorMessage, "existing rows migrate as \"no failure recorded\"")
+        XCTAssertNil(row.fusionFailedAt)
+
+        // And the new columns are writable on that pre-existing row.
+        try migrated.recordFusionFailure(sessionId: sessionId, message: "No Anthropic API key is saved.")
+        XCTAssertEqual(
+            try migrated.session(id: sessionId)?.fusionErrorMessage,
+            "No Anthropic API key is saved."
+        )
+    }
+
+    // MARK: Fusion failure persistence (SPEC §4.5)
+
+    /// The bug this exists for: the reason a session failed used to live only
+    /// in the History window's memory, so a relaunch showed a permanently
+    /// failed session as an eternal "fusing" spinner. It must round-trip
+    /// through a CLOSED-and-reopened store.
+    func testFusionFailureRoundTripsAcrossStoreReopen() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scribe-failure-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("store.sqlite").path
+
+        let message = "No Anthropic API key is saved. Add one in Settings, then retry."
+        let failedAt = Date(timeIntervalSince1970: 1_750_000_000)
+        let sessionId: UUID
+        do {
+            let store = try MeetingStore(path: path)
+            var session = try store.createSession()
+            session.state = .processing
+            session.endedAt = Date()
+            try store.updateSession(session)
+            try store.recordFusionFailure(sessionId: session.id, message: message, at: failedAt)
+            sessionId = session.id
+        }
+
+        let reopened = try MeetingStore(path: path)
+        let row = try XCTUnwrap(try reopened.session(id: sessionId))
+        XCTAssertEqual(row.state, .processing, "SPEC §4.5: a failure leaves the session in processing")
+        XCTAssertEqual(row.fusionErrorMessage, message)
+        XCTAssertEqual(row.fusionFailedAt?.timeIntervalSince1970 ?? 0, failedAt.timeIntervalSince1970, accuracy: 0.001)
+    }
+
+    func testClearFusionFailureRemovesBothColumns() throws {
+        let store = try makeStore()
+        let session = try store.createSession()
+        try store.recordFusionFailure(sessionId: session.id, message: "network down")
+        XCTAssertNotNil(try store.session(id: session.id)?.fusionErrorMessage)
+
+        try store.clearFusionFailure(sessionId: session.id)
+        let row = try XCTUnwrap(try store.session(id: session.id))
+        XCTAssertNil(row.fusionErrorMessage)
+        XCTAssertNil(row.fusionFailedAt)
+    }
+
+    /// Targeted UPDATE, not read-modify-write: recording a failure must not
+    /// roll back a title or state someone else wrote while fusion ran.
+    func testRecordFusionFailureTouchesOnlyTheFailureColumns() throws {
+        let store = try makeStore()
+        var session = try store.createSession()
+        session.title = "Acme renewal call"
+        session.state = .processing
+        try store.updateSession(session)
+
+        try store.recordFusionFailure(sessionId: session.id, message: "the provider timed out")
+
+        let row = try XCTUnwrap(try store.session(id: session.id))
+        XCTAssertEqual(row.title, "Acme renewal call")
+        XCTAssertEqual(row.state, .processing)
+        XCTAssertEqual(row.fusionErrorMessage, "the provider timed out")
     }
 
     // MARK: Segment upsert (Spike 3 core proof, SPEC §4.2)
@@ -62,7 +167,7 @@ final class PersistenceTests: XCTestCase {
         try crashed.upsertSegment(SegmentRecord(id: segmentId, sessionId: session.id, channel: .remote, text: "hello", startOffset: 0, endOffset: 2, isFinal: true))
 
         let reopened = try MeetingStore(path: path)  // recovery path
-        XCTAssertEqual(try reopened.schemaVersion, 1)
+        XCTAssertEqual(try reopened.schemaVersion, 2)
         XCTAssertEqual(try reopened.segmentCount(sessionId: session.id), 1)
         XCTAssertEqual(try reopened.segments(sessionId: session.id)[0].text, "hello")
     }

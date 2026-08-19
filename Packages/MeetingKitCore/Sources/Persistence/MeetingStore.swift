@@ -89,6 +89,36 @@ public final class MeetingStore: Sendable {
         }
     }
 
+    /// Records why the last fusion attempt failed (SPEC §4.5), on the session
+    /// row so the reason survives a relaunch — see
+    /// `SessionRecord.fusionErrorMessage`.
+    ///
+    /// A targeted UPDATE rather than a read-modify-write of the whole record:
+    /// fusion is a long call, and the row's `title`/`state` may have been
+    /// rewritten by someone else while it ran. Only the two failure columns
+    /// are touched. No-op for an unknown id.
+    public func recordFusionFailure(sessionId: UUID, message: String, at date: Date = Date()) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE sessions SET fusionErrorMessage = ?, fusionFailedAt = ? WHERE id = ?",
+                arguments: [message, date, sessionId]
+            )
+        }
+    }
+
+    /// Clears a recorded fusion failure — a later attempt stored a note, or a
+    /// retry is starting, so the stale reason must stop being displayed
+    /// (SPEC §4.5 Retry). Targeted UPDATE, for the reason on
+    /// `recordFusionFailure`. No-op for an unknown id.
+    public func clearFusionFailure(sessionId: UUID) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE sessions SET fusionErrorMessage = NULL, fusionFailedAt = NULL WHERE id = ?",
+                arguments: [sessionId]
+            )
+        }
+    }
+
     public func deleteSession(id: UUID) throws {
         _ = try dbQueue.write { db in
             try SessionRecord.filter(Column("id") == id).deleteAll(db)
