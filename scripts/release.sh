@@ -64,7 +64,10 @@ if (( DRY_RUN )); then
   echo "    signing identity:   ${SCRIBE_SIGNING_IDENTITY:-<unset>}"
   echo "    notary profile:     ${SCRIBE_NOTARY_PROFILE:-<unset>}"
   echo "    Sparkle feed URL:   ${SCRIBE_FEED_URL:-<unset>}"
-  echo "    Sparkle Ed25519:    ${SCRIBE_PUBLIC_ED_KEY:+set}${SCRIBE_PUBLIC_ED_KEY:-<unset>}"
+  # `${x:+set}${x:-<unset>}` printed "set" AND the value when set, because the
+  # second expansion falls through whenever x is non-empty. Only one branch
+  # should ever appear.
+  echo "    Sparkle Ed25519:    ${SCRIBE_PUBLIC_ED_KEY:-<unset — update verification disabled>}"
   echo "    version/build:      from project / ${BUILD_NUMBER}"
   echo "    1. xcodegen generate"
   echo "    2. xcodebuild -configuration Release (signed, SUFeedURL=<feed>,"
