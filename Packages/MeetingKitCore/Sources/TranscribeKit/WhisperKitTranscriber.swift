@@ -307,11 +307,20 @@ actor ChannelWorker {
         }
         guard !hypotheses.isEmpty else { return }
 
+        // Single chokepoint for special-token stripping (SPEC §4.2): this is
+        // the ONE place a `TranscriptSegment`'s text is produced from engine
+        // output, so stripping here — rather than at each display site —
+        // guarantees no token ever reaches the store, History, exports, the
+        // fusion prompt, or the NotesValidator haystack, for ANY
+        // `WhisperEngine` implementation. `strip` also normalises the
+        // whitespace tokens leave behind, so segments never start with a
+        // stray space; a hypothesis that was nothing but tokens becomes
+        // empty and is filtered out (a window of only tokens emits nothing
+        // instead of a blank segment).
         let text = hypotheses
-            .map(\.text)
+            .map { WhisperSpecialTokens.strip($0.text) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
         // Offsets (SPEC §4.2): chunk sessionOffset + window position within

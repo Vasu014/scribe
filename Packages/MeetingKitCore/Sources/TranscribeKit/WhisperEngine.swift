@@ -69,11 +69,27 @@ public actor WhisperKitEngine: WhisperEngine {
         // file-based entry points in WhisperKit are the `audioPath(s:)`
         // overloads, which we never call. No cache/temp-write options exist
         // on this API; there is nothing left to disable.
-        let results = try await whisper.transcribe(audioArray: samples, segmentCallback: nil)
+        //
+        // `skipSpecialTokens: true` is the ROOT-CAUSE fix for token leakage:
+        // WhisperKit's default (`false`) decodes the control tokens
+        // (`<|startoftranscript|>`, `<|en|>`, `<|0.00|>`, `<|endoftext|>`…)
+        // straight into `TranscriptionSegment.text`. It does not affect
+        // `segment.start`/`.end`, which are computed from the timestamp
+        // token IDS, so window offsets are unchanged. Everything else stays
+        // at WhisperKit's defaults (what `decodeOptions: nil` used).
+        let options = DecodingOptions(skipSpecialTokens: true)
+        let results = try await whisper.transcribe(
+            audioArray: samples,
+            decodeOptions: options,
+            segmentCallback: nil
+        )
         guard let result = results.first else { return [] }
         return result.segments.map { segment in
             WhisperHypothesis(
-                text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                // Defensive strip as well as the option above: persisted
+                // transcripts must never carry tokens even if a future model
+                // or option change slips past `skipSpecialTokens`.
+                text: WhisperSpecialTokens.strip(segment.text),
                 startSeconds: Double(segment.start),
                 endSeconds: Double(segment.end)
             )
