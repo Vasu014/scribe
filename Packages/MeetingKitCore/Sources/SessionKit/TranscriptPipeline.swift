@@ -80,11 +80,30 @@ final class TranscriptPipeline: @unchecked Sendable {
         continuation?.yield(chunk)
     }
 
-    /// Ends both channel streams, then waits for both transcription
-    /// consumers to drain everything they emitted into the store. Called by
-    /// the coordinator at stop, BEFORE fusion runs (SPEC §4.4: stop
-    /// finalizes pending segments → processing → fusion).
-    func finish() async {
+    /// Ends both channel streams, then waits — FOR AT MOST `timeout` — for
+    /// both transcription consumers to drain everything they emitted into
+    /// the store. Called by the coordinator at stop, BEFORE fusion runs
+    /// (SPEC §4.4: stop finalizes pending segments → processing → fusion).
+    ///
+    /// - Returns: `true` if both consumers drained; `false` on timeout.
+    ///
+    /// BOUNDED BY DESIGN. The consumer tasks await whatever the injected
+    /// `Transcriber` does, and a production transcriber can stall
+    /// unboundedly before it ever looks at its input stream — the app's
+    /// `LazyWhisperKitTranscriber` resolves (and, on a cold Hub cache,
+    /// FETCHES) a ~500 MB Core ML model inside `transcribe(stream:)`, so
+    /// finishing the input stream does not finish the output stream. An
+    /// unbounded wait here hung `SessionCoordinator.stop()` forever: the
+    /// session never reached `processing`, the Stop button became a no-op,
+    /// and the row was left in `recording` (T10 dogfood bug). Stopping a
+    /// meeting is a user-facing promise and must not be hostage to the
+    /// transcription engine.
+    ///
+    /// On timeout the consumers are cancelled and abandoned: every
+    /// hypothesis they already emitted is in SQLite (this pipeline persists
+    /// immediately — see class docs), so at most the final in-flight window
+    /// is lost, and fusion can be retried (SPEC §4.5).
+    func finish(timeout: TimeInterval) async -> Bool {
         let remaining = withLock {
             let remaining = continuations
             continuations = [:]
@@ -93,8 +112,33 @@ final class TranscriptPipeline: @unchecked Sendable {
         for continuation in remaining.values {
             continuation.finish()
         }
-        for task in tasks {
-            await task.value
+
+        // One-shot race: whichever of drain/deadline arrives first wins. A
+        // task group would be wrong here — it awaits ALL its children before
+        // returning, so the stalled drain child would re-introduce the hang.
+        let (outcomes, report) = AsyncStream<Bool>.makeStream()
+        let drain = Task { [tasks] in
+            for task in tasks {
+                await task.value
+            }
+            report.yield(true)
         }
+        let deadline = Task {
+            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+            report.yield(false)
+        }
+        var drained = false
+        for await outcome in outcomes {
+            drained = outcome
+            break
+        }
+        deadline.cancel()
+        if !drained {
+            drain.cancel()
+            for task in tasks {
+                task.cancel() // best effort; an engine stalled off-stream ignores it
+            }
+        }
+        return drained
     }
 }

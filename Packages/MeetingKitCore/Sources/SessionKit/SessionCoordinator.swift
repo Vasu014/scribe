@@ -49,6 +49,12 @@ public enum CoordinatorEvent: Equatable, Sendable {
     /// Fusion failed (SPEC §4.5): session stays in `processing` with Retry;
     /// the message is for the Retry UI.
     case fusionFailed(sessionId: UUID, message: String)
+    /// The transcript pipeline did not drain within
+    /// `SessionCoordinator.transcriptDrainTimeout` at stop, so it was
+    /// abandoned and fusion ran on whatever had already been persisted. The
+    /// session itself stopped cleanly — this is a transcription-quality
+    /// warning (a stalled or still-loading engine), not a lifecycle failure.
+    case transcriptDrainTimedOut(sessionId: UUID)
 }
 
 /// Errors thrown by `SessionCoordinator.start()`.
@@ -76,6 +82,15 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// `defaultFusionRunner(store:provider:lookback:)` does.
     public let lookback: TimeInterval
 
+    /// How long `stop()` waits for the transcript pipeline to drain before
+    /// abandoning it and going on to fusion (see `stop()` step 4).
+    ///
+    /// The 10 s default is generous against the real finalization budget — a
+    /// `small.en` window decodes in ~2 s and SPEC §4.2 puts finalization 3–5 s
+    /// after speech ends — while staying far below "the app is broken". It
+    /// exists to bound a STALLED transcriber, not to rush a working one.
+    public let transcriptDrainTimeout: TimeInterval
+
     private let store: MeetingStore
     private let engine: any CaptureEngine
     private let transcriber: any Transcriber
@@ -98,7 +113,31 @@ public final class SessionCoordinator: @unchecked Sendable {
     private var displayStateStorage: SessionDisplayState = .idle
     private var currentSessionStorage: SessionRecord?
     private var clockStorage: SessionClock?
-    private var pipelineStorage: TranscriptPipeline?
+    /// The recording session's transcript pipeline, TAGGED with the id of the
+    /// session that owns it.
+    ///
+    /// The tag is load-bearing. `stop()`'s drain is BOUNDED (10 s), so
+    /// `start()` for the next session is legal while a previous stop is still
+    /// draining (`start` admits `phase == .processing`, which `stop` sets
+    /// *before* the drain). With a single untagged slot, the late teardown
+    /// nilled out the NEW session's pipeline: `feedAudio` then dropped every
+    /// sample and the session persisted ZERO segments, silently. Teardown is
+    /// now compare-and-clear (`clearPipeline(for:)`), so a stalled or
+    /// timed-out drain can only ever clear its own pipeline.
+    private var pipelineStorage: (sessionId: UUID, pipeline: TranscriptPipeline)?
+
+    /// Sessions with a fusion run in flight, from `stop()` or `retryFusion`.
+    ///
+    /// Fusion is a long, PAID network call and Retry is live for every row in
+    /// `processing` — including while `stop()`'s own run, or an earlier
+    /// retry, is still going. Without this guard a second click spawned a
+    /// second concurrent run: two API charges, two `insertCanonicalNote`
+    /// demote-then-insert races, and whichever run finished LAST won the
+    /// session state (a stale `.complete` landing after a newer failure).
+    /// Claimed by `admitFusion(for:)`, released by `releaseFusion(for:)` from
+    /// a `defer` so every exit path — early return, error, cancellation —
+    /// frees it.
+    private var fusionsInFlight: Set<UUID> = []
     private var composerStorage: FragmentComposer?
     private var pendingFragmentId: UUID?
     private var pendingFragmentAnchor: TimeInterval?
@@ -109,6 +148,8 @@ public final class SessionCoordinator: @unchecked Sendable {
     ///   - captureEngine: capture seam (stub until Spike 1 / T4).
     ///   - transcriber: transcription seam (stub until Spike 2 / T3).
     ///   - lookback: fragment effective-anchor lookback (SPEC §4.3, default 20 s).
+    ///   - transcriptDrainTimeout: stop's bounded wait for transcription to
+    ///     drain; see the property. Tests shorten it.
     ///   - fusionRunner: end-of-session fusion executor; see `FusionRunner`
     ///     for why this is a closure. Use `defaultFusionRunner` in the App.
     ///
@@ -123,12 +164,14 @@ public final class SessionCoordinator: @unchecked Sendable {
         captureEngine: any CaptureEngine,
         transcriber: any Transcriber,
         lookback: TimeInterval = 20,
+        transcriptDrainTimeout: TimeInterval = 10,
         fusionRunner: @escaping FusionRunner
     ) {
         self.store = store
         self.engine = captureEngine
         self.transcriber = transcriber
         self.lookback = lookback
+        self.transcriptDrainTimeout = transcriptDrainTimeout
         self.fusionRunner = fusionRunner
 
         // Crash-recovery scan (SPEC §4.4). Best-effort: a store failure here
@@ -219,7 +262,7 @@ public final class SessionCoordinator: @unchecked Sendable {
 
         withLock {
             clockStorage = clock
-            pipelineStorage = pipeline
+            pipelineStorage = (session.id, pipeline)
             currentSessionStorage = session
             phase = .recording
         }
@@ -232,11 +275,14 @@ public final class SessionCoordinator: @unchecked Sendable {
         } catch {
             engine.onAudio = nil
             await engine.stop()
-            await pipeline.finish()
+            // Nothing to drain: the engine never delivered a sample, and the
+            // caller is a UI click waiting on this throw — don't sit on a
+            // transcriber that may still be loading its model.
+            _ = await pipeline.finish(timeout: 0)
+            clearPipeline(for: session.id)
             withLock {
                 phase = .idle
                 currentSessionStorage = nil
-                pipelineStorage = nil
                 clockStorage = nil
             }
             try? store.deleteSession(id: session.id)
@@ -252,18 +298,30 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// 1. Flush the pending fragment (composer, if attached — SPEC §4.3
     ///    pending-row: a crash loses at most ~1 s of typing, a stop loses
     ///    nothing).
-    /// 2. Stop the capture engine, then drain the transcript pipeline so
-    ///    every hypothesis already emitted is in SQLite.
-    /// 3. Finalize pending segments: DECISION — non-final hypotheses are
-    ///    marked `isFinal = true`. The meeting is over; they will never be
-    ///    revised, and History/export should read settled rows. (Leaving
-    ///    them non-final would also be defensible; the flag exists so later
+    /// 2. Stop the capture engine.
+    /// 3. Wall-clock `endedAt` + state `.processing` — WRITTEN AND ANNOUNCED
+    ///    HERE, before any transcription draining. Everything after this
+    ///    point is post-processing the user has already been told about;
+    ///    nothing that can stall may sit between the click and this write.
+    ///    (T10 dogfood bug: this used to come last, after an UNBOUNDED wait
+    ///    on the transcript pipeline. When the transcriber stalled — model
+    ///    still loading — `stop()` never got here: the row stayed
+    ///    `recording`, `displayState` stayed `.recording` so the panel kept
+    ///    showing the red dot and Stop, `elapsed()` returned 0 because the
+    ///    phase was `.stopping` (a frozen `00:00`), and every further Stop
+    ///    click hit the `phase == .recording` guard and did nothing.)
+    /// 4. Drain the transcript pipeline — BOUNDED by `transcriptDrainTimeout`
+    ///    — so every hypothesis already emitted is in SQLite, then finalize
+    ///    pending segments: DECISION — non-final hypotheses are marked
+    ///    `isFinal = true`. The meeting is over; they will never be revised,
+    ///    and History/export should read settled rows. (Leaving them
+    ///    non-final would also be defensible; the flag exists so later
     ///    phases can distinguish live revisions, and post-stop there are
     ///    none.)
-    /// 4. Wall-clock `endedAt` + state `.processing`, then fusion via the
-    ///    injected runner. Outcome (SPEC §4.5): success → `.complete` +
-    ///    `.done`; validator findings → stays `.processing`, findings
-    ///    surfaced; failure → stays `.processing`, error surfaced for Retry.
+    /// 5. Fusion via the injected runner. Outcome (SPEC §4.5): success →
+    ///    `.complete` + `.done`; validator findings → stays `.processing`,
+    ///    findings surfaced; failure → stays `.processing`, error surfaced
+    ///    for Retry.
     ///
     /// Idempotent: extra calls while not recording are no-ops; a second
     /// call while a stop is already in flight returns immediately (it does
@@ -274,7 +332,7 @@ public final class SessionCoordinator: @unchecked Sendable {
                   let session = currentSessionStorage,
                   let clock = clockStorage else { return nil }
             phase = .stopping
-            return (session, clock, composerStorage, pipelineStorage)
+            return (session, clock, composerStorage, pipelineStorage?.pipeline)
         }
         guard let held else { return }
         let session = held.session
@@ -282,18 +340,13 @@ public final class SessionCoordinator: @unchecked Sendable {
         // 1. Flush the pending fragment while the clock is still queryable.
         held.composer?.flush(at: held.clock.nowOffset())
 
-        // 2. Stop producing audio, then drain transcription into the store.
+        // 2. Stop producing audio (bounded: the engine tears down its own
+        //    graph and streams).
         engine.onAudio = nil
         await engine.stop()
-        if let pipeline = held.pipeline {
-            await pipeline.finish()
-            withLock { pipelineStorage = nil }
-        }
 
-        // 3. Finalize non-final hypotheses (decision documented above).
-        finalizeNonFinalSegments(sessionId: session.id)
-
-        // 4. `processing` + wall-clock end, then fusion.
+        // 3. `processing` + wall-clock end — the user-visible half of Stop,
+        //    committed before anything that can stall (see doc comment).
         var row = (try? store.session(id: session.id)) ?? session
         row.endedAt = Date()
         row.state = .processing
@@ -305,8 +358,34 @@ public final class SessionCoordinator: @unchecked Sendable {
         }
         setDisplay(.processing)
 
+        // 4. Drain transcription into the store, bounded, then finalize.
+        if let pipeline = held.pipeline {
+            let drained = await pipeline.finish(timeout: transcriptDrainTimeout)
+            // Compare-and-clear: by the time a timed-out drain gets here the
+            // user may already have started the NEXT session, whose pipeline
+            // now owns the slot. See `pipelineStorage`.
+            clearPipeline(for: session.id)
+            if !drained {
+                eventBus.emit(.transcriptDrainTimedOut(sessionId: session.id))
+            }
+        }
+        finalizeNonFinalSegments(sessionId: session.id)
+
+        // 5. Fusion. One run per session at a time (see `fusionsInFlight`):
+        //    the row has been in `processing` since step 3, so History's
+        //    Retry has been live for the whole bounded drain.
+        row = (try? store.session(id: session.id)) ?? row
+        guard admitFusion(for: row.id) else { return }
+        defer { releaseFusion(for: row.id) }
+
         let outcome = await fusionRunner(row)
-        apply(outcome, to: row, drivesDisplay: true)
+        // `drivesDisplay` is resolved at APPLY time, after the await — not at
+        // entry and not before the call. Fusion is a long network call and
+        // the user may have started the next meeting DURING it; resolving any
+        // earlier hands this finished run permission to overwrite the live
+        // `.recording` display state of a session that is still running.
+        let drivesDisplay = withLock { currentSessionStorage?.id == row.id }
+        apply(outcome, to: row, drivesDisplay: drivesDisplay)
     }
 
     /// Re-runs fusion for a session stuck in `processing` after a failure
@@ -328,11 +407,25 @@ public final class SessionCoordinator: @unchecked Sendable {
               let row = try? store.session(id: resolved.target.id),
               row.state == .processing else { return }
 
+        // One run per session at a time — a second Retry click while this
+        // one is in flight is a no-op, not a second paid API call whose
+        // stale outcome can land last and win. See `fusionsInFlight`.
+        guard admitFusion(for: row.id) else { return }
+        defer { releaseFusion(for: row.id) }
+
         if resolved.drivesDisplay {
+            // Entry-time resolution is correct HERE: this fires before the
+            // await, while `resolved` is still true.
             setDisplay(.processing) // leave the ⚠ state while retrying
         }
         let outcome = await fusionRunner(row)
-        apply(outcome, to: row, drivesDisplay: resolved.drivesDisplay)
+        // Re-resolved at APPLY time (mirrors `stop()`): a retry that
+        // completes during a LATER recording must not overwrite that
+        // session's `.recording` display state — doing so hides the chip and
+        // flips the menu item back to "Start Meeting", leaving a live meeting
+        // the user has no way to stop.
+        let drivesDisplay = withLock { currentSessionStorage?.id == row.id }
+        apply(outcome, to: row, drivesDisplay: drivesDisplay)
     }
 
     // MARK: Interruptions (SPEC §4.1/§4.4)
@@ -423,7 +516,7 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// pipeline drops everything.
     private func feedAudio(_ sample: CapturedSample) {
         let pipeline = withLock {
-            phase == .recording ? pipelineStorage : nil
+            phase == .recording ? pipelineStorage?.pipeline : nil
         }
         pipeline?.feed(sample)
     }
@@ -432,6 +525,27 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// The transient semantics of `.done` (4 s, clickable) and the clearing
     /// of `.failed` are owned by the menu bar; the coordinator only reports
     /// storage-driven transitions.
+    /// Clears the pipeline slot ONLY if it still holds `sessionId`'s
+    /// pipeline. A teardown that arrives after the next session has already
+    /// started is a no-op instead of a silent kill. See `pipelineStorage`.
+    private func clearPipeline(for sessionId: UUID) {
+        withLock {
+            if pipelineStorage?.sessionId == sessionId { pipelineStorage = nil }
+        }
+    }
+
+    /// Claims the single fusion slot for `sessionId`. Returns `false` when a
+    /// run is already in flight for that session — the caller must then be a
+    /// no-op. Always pair with `releaseFusion(for:)` in a `defer`.
+    private func admitFusion(for sessionId: UUID) -> Bool {
+        withLock { fusionsInFlight.insert(sessionId).inserted }
+    }
+
+    /// Releases the fusion slot claimed by `admitFusion(for:)`.
+    private func releaseFusion(for sessionId: UUID) {
+        withLock { _ = fusionsInFlight.remove(sessionId) }
+    }
+
     private func setDisplay(_ state: SessionDisplayState) {
         withLock { displayStateStorage = state }
         eventBus.emit(.stateChanged(state))
