@@ -63,6 +63,11 @@ import Persistence
 /// `CanonicalRendering.normalizedTextWindows`. A backchannel from the other
 /// speaker used to split a verbatim quote and fire a false `quoteMismatch`.
 ///
+/// **Quotes are matched against the raw transcript ∪ the cleaned one** — see
+/// `HaystackSource`. The prompt renders `TranscriptCleanup.clean(...)`, so a
+/// quote may legitimately read across a filler or a collapsed loop copy that
+/// the raw segments still contain.
+///
 /// **`None recorded.` and friends are exempt** from check (c), as are
 /// continuation lines and indented sub-bullets (they fold into their parent
 /// item rather than each demanding their own citation). Sections other than
@@ -118,6 +123,7 @@ public enum NotesValidator {
         // segments never reaches fusion; see FusionService.emptyTranscript.)
         guard !segments.isEmpty else { return [] }
         let maxEnd = segments.map(\.endOffset).max() ?? 0
+        let haystacks = HaystackSource(segments: segments)
         var findings: [Finding] = []
 
         for block in blocks(in: markdown) {
@@ -148,10 +154,7 @@ public enum NotesValidator {
                 // of a SINGLE channel (never across speakers).
                 let needle = CanonicalRendering.normalize(citation.quote)
                 guard !needle.isEmpty else { continue }
-                let haystacks = CanonicalRendering.normalizedTextWindows(
-                    segments, around: citation.offset, window: matchWindow
-                )
-                if !haystacks.contains(where: { $0.contains(needle) }) {
+                if !haystacks.matches(needle, around: citation.offset) {
                     findings.append(Finding(
                         kind: .quoteMismatch,
                         detail: "Quote near \(CanonicalRendering.timestamp(citation.offset)) — “\(citation.quote)” — has no matching span in the transcript within ±\(Int(matchWindow)) s. Verify before sending."
@@ -160,6 +163,54 @@ public enum NotesValidator {
             }
         }
         return findings
+    }
+
+    // MARK: - Haystacks (raw ∪ cleaned)
+
+    /// The text a quote is allowed to have come from.
+    ///
+    /// The fusion prompt renders the **cleaned** transcript
+    /// (`TranscriptCleanup`), while this validator is also called straight
+    /// from the History window against the **raw** segments in the store. A
+    /// quote lifted from either one is a genuine quote, so both are searched
+    /// and a match in either passes.
+    ///
+    /// Why this is not a hole in the audit: cleanup only ever *deletes*
+    /// tokens (loop copies, filler-only segments) — it never invents a word,
+    /// reorders speech, or crosses channels. So the cleaned haystack contains
+    /// no vocabulary the raw haystack lacked; the only quotes it newly admits
+    /// are ones that read across a deleted filler or a deleted loop copy,
+    /// which is exactly the text the model was shown. A fabricated quote
+    /// matches neither.
+    ///
+    /// Same-speaker merging (`CanonicalRendering.mergeConsecutiveSameSpeaker`)
+    /// needs no entry here: a merged block's text is the same segments, in
+    /// the same order, joined by the same single space that
+    /// `normalizedTextWindows` uses — it is already a substring of the
+    /// per-channel haystack. What merging *does* move is the cited
+    /// timestamp, which is why blocks are capped at
+    /// `CanonicalRendering.maxMergedBlockSpan` < `matchWindow`.
+    struct HaystackSource {
+        let raw: [SegmentRecord]
+        /// `nil` when cleanup was a no-op — no point searching twice.
+        let cleaned: [SegmentRecord]?
+
+        init(segments: [SegmentRecord]) {
+            self.raw = segments
+            let cleaned = TranscriptCleanup.clean(segments)
+            self.cleaned = cleaned == segments ? nil : cleaned
+        }
+
+        func matches(_ needle: String, around offset: TimeInterval) -> Bool {
+            let windows = CanonicalRendering.normalizedTextWindows(
+                raw, around: offset, window: matchWindow
+            )
+            if windows.contains(where: { $0.contains(needle) }) { return true }
+            guard let cleaned else { return false }
+            return CanonicalRendering
+                .normalizedTextWindows(cleaned, around: offset, window: matchWindow)
+                .contains { $0.contains(needle) }
+        }
     }
 
     // MARK: - Block model

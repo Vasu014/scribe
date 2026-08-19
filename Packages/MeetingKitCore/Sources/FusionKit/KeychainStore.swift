@@ -17,8 +17,8 @@ public enum KeychainStoreError: Error, Equatable, Sendable {
 /// entered in Settings). Public so the App target can use it directly for the
 /// masked key field in Settings (SPEC §5).
 ///
-/// Uses `kSecUseDataProtectionKeychain` so the item behaves correctly with
-/// the app's (future) entitlements on modern macOS.
+/// Uses the login keychain, NOT the data-protection keychain — see the
+/// query builder for why the latter cannot work for a Developer ID app.
 ///
 /// Service name is the app's bundle id, `io.github.vasu014.scribe` (SPEC §3.1,
 /// finalized 2026-08-19). Changing it strands every saved key: Keychain items
@@ -115,7 +115,15 @@ public final class KeychainStore: Sendable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecUseDataProtectionKeychain as String: true,
+            // NOT kSecUseDataProtectionKeychain. That keychain requires a
+            // `keychain-access-groups` entitlement, which only a sandboxed /
+            // App Store app carries; Scribe is a non-sandboxed Developer ID
+            // app (SPEC §6 rules the App Store out because the capture
+            // pattern cannot be sandboxed). Requesting it made every
+            // SecItemAdd fail with -34018 errSecMissingEntitlement — even
+            // after proper Developer ID signing — so the API key could never
+            // be saved and fusion could never run. The file-based login
+            // keychain is the correct store for this distribution model.
         ]
     }
 }

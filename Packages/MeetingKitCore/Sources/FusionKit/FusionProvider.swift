@@ -7,7 +7,15 @@ import Persistence
 public enum PromptVersion {
     /// v1: initial format — [MM:SS]/[H:MM:SS] per-timestamp rule, Me/Them
     /// labels, [USER NOTE @ …] injection, timestamp+quote citations.
-    public static let current = "1"
+    ///
+    /// v2: same prompt text, different transcript bytes — deterministic
+    /// cleanup (`TranscriptCleanup`: loop collapse, filler-only segments,
+    /// sub-second fragment folding, whitespace/punctuation) plus
+    /// same-speaker block merging in the rendering
+    /// (`CanonicalRendering.mergeConsecutiveSameSpeaker`). The rendering
+    /// format is versioned together with the prompt text, so this is a bump
+    /// even though `SystemPrompt.v1` is untouched.
+    public static let current = "2"
 }
 
 /// Fusion input — everything the prompt assembler needs, read from the store.
@@ -55,6 +63,33 @@ public protocol FusionProvider: Sendable {
     /// - Returns: raw model output; parsing (title extraction, validation)
     ///   happens in FusionKit, not the provider.
     func complete(systemPrompt: String, userPrompt: String, temperature: Double) async throws -> String
+
+    /// Same call, plus one thing only the caller knows: whether this user
+    /// message is a **reusable prefix** — the same bytes a later request in
+    /// this session will send again (a Retry, or a second pass over the same
+    /// transcript). Providers that support prompt caching put their
+    /// breakpoint there; a breakpoint on content that is unique to one
+    /// request buys nothing and still pays the cache-write premium.
+    ///
+    /// Defaulted in an extension, so existing providers (and every test
+    /// double) conform unchanged.
+    func complete(
+        systemPrompt: String,
+        userPrompt: String,
+        temperature: Double,
+        userPromptIsReusablePrefix: Bool
+    ) async throws -> String
+}
+
+public extension FusionProvider {
+    func complete(
+        systemPrompt: String,
+        userPrompt: String,
+        temperature: Double,
+        userPromptIsReusablePrefix: Bool
+    ) async throws -> String {
+        try await complete(systemPrompt: systemPrompt, userPrompt: userPrompt, temperature: temperature)
+    }
 }
 
 /// Pure prompt assembly + output parsing. No transport, no side effects —
@@ -63,11 +98,16 @@ public protocol FusionProvider: Sendable {
 /// extraction/sanitization).
 public enum PromptAssembler {
 
-    /// Full user message: rendered transcript with fragments injected at
-    /// effective anchors (SPEC §4.5 prompt assembly).
+    /// Full user message: deterministically cleaned transcript
+    /// (`TranscriptCleanup`) rendered with fragments injected at effective
+    /// anchors and consecutive same-speaker segments merged into blocks
+    /// (SPEC §4.5 prompt assembly).
+    ///
+    /// Cleanup is idempotent, so it does not matter whether the caller
+    /// already cleaned (`FusionService` does, before chunking).
     public static func userPrompt(for input: FusionInput) -> String {
         CanonicalRendering.renderTranscriptWithFragments(
-            input.segments,
+            TranscriptCleanup.clean(input.segments),
             fragments: input.fragments,
             lookback: input.lookback
         )

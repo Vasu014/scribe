@@ -67,9 +67,72 @@ public enum CanonicalRendering {
         "[USER NOTE @ \(timestampText(anchorOffset))] \(text)"
     }
 
+    // MARK: Same-speaker blocks (prompt rendering only)
+
+    /// Longest stretch of wall-clock a merged block may cover.
+    ///
+    /// **This number is pinned to the validator, not to taste.** A merged
+    /// block carries ONE timestamp — its first segment's start — and the
+    /// model cites that timestamp for anything it quotes out of the block.
+    /// `NotesValidator` looks for the quote in segments overlapping
+    /// ±`NotesValidator.matchWindow` (30 s) of the cited offset, so a block
+    /// whose tail sat more than 30 s after its own head would cite a
+    /// timestamp whose window no longer contains the quoted words — a false
+    /// `quoteMismatch` on a perfectly genuine quote. 25 s keeps 5 s of
+    /// headroom. Raising this above `NotesValidator.matchWindow` breaks
+    /// citations; there is a test that says so.
+    public static let maxMergedBlockSpan: TimeInterval = 25
+
+    /// Merges consecutive same-speaker segments into one block: one
+    /// timestamp, one `Me:`/`Them:` label, texts joined with a single space.
+    ///
+    /// Two-channel capture already keeps the speakers apart, so "consecutive"
+    /// means adjacent in the time-sorted order *and* on the same channel — a
+    /// block never spans speakers, which is what keeps
+    /// `normalizedTextWindows`' per-channel haystacks a superset of every
+    /// block's text (the same segments, the same joiner, the same order).
+    ///
+    /// - Parameters:
+    ///   - barriers: sort keys that must not be swallowed — the effective
+    ///     anchors of user notes. A note sorts *before* a transcript line at
+    ///     the same key, so a segment starting at or after a barrier may not
+    ///     merge into a block that started before it; otherwise the note would
+    ///     drift to after speech it was written about.
+    ///   - maxSpan: see `maxMergedBlockSpan`.
+    public static func mergeConsecutiveSameSpeaker(
+        _ segments: [SegmentRecord],
+        barriers: [TimeInterval] = [],
+        maxSpan: TimeInterval = maxMergedBlockSpan
+    ) -> [SegmentRecord] {
+        let sorted = segments.sorted {
+            ($0.startOffset, $0.id.uuidString) < ($1.startOffset, $1.id.uuidString)
+        }
+        var result: [SegmentRecord] = []
+        for segment in sorted {
+            if var block = result.last,
+               block.channel == segment.channel,
+               segment.endOffset - block.startOffset <= maxSpan,
+               !barriers.contains(where: { $0 > block.startOffset && $0 <= segment.startOffset }) {
+                block.text += " " + segment.text
+                block.endOffset = max(block.endOffset, segment.endOffset)
+                result[result.count - 1] = block
+            } else {
+                result.append(segment)
+            }
+        }
+        return result
+    }
+
     // MARK: Renderings
 
-    /// Full transcript rendering, sorted by start offset.
+    /// Full transcript rendering, one line per segment, sorted by start
+    /// offset.
+    ///
+    /// Deliberately NOT merged: this is the verbatim transcript surface (the
+    /// History window's Transcript tab), where a reader wants the segment
+    /// timeline the recogniser actually produced. Same-speaker merging is a
+    /// prompt-side token optimisation and lives in
+    /// `renderTranscriptWithFragments`.
     public static func renderTranscript(_ segments: [SegmentRecord]) -> String {
         segments
             .sorted { $0.startOffset < $1.startOffset }
@@ -80,6 +143,11 @@ public enum CanonicalRendering {
     /// Transcript with fragments injected inline at their EFFECTIVE anchor
     /// (`anchorOffset − lookback`, clamped to ≥ 0 — the lookback rule, SPEC §4.3).
     /// User notes sort before transcript lines at the same key.
+    ///
+    /// This is the PROMPT rendering: consecutive same-speaker segments merge
+    /// into one block (`mergeConsecutiveSameSpeaker`), which removes a
+    /// timestamp + speaker label per merged segment. User-note anchors act as
+    /// merge barriers so a note never drifts past the speech it annotates.
     public static func renderTranscriptWithFragments(
         _ segments: [SegmentRecord],
         fragments: [FragmentRecord],
@@ -91,15 +159,17 @@ public enum CanonicalRendering {
             let line: String
         }
         var entries: [Entry] = []
+        var barriers: [TimeInterval] = []
         for fragment in fragments {
             let effective = max(0, fragment.anchorOffset - lookback)
+            barriers.append(effective)
             entries.append(Entry(
                 key: effective,
                 order: 0,
                 line: userNoteLine(text: fragment.text, anchorOffset: fragment.anchorOffset)
             ))
         }
-        for segment in segments {
+        for segment in mergeConsecutiveSameSpeaker(segments, barriers: barriers) {
             entries.append(Entry(
                 key: segment.startOffset,
                 order: 1,

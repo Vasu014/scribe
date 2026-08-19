@@ -75,10 +75,10 @@ public final class FusionService: Sendable {
         provider: any FusionProvider,
         chunkWordLimit: Int = FusionService.chunkWordLimit
     ) async -> FusionRunOutcome {
-        let segments: [SegmentRecord]
+        let rawSegments: [SegmentRecord]
         let fragments: [FragmentRecord]
         do {
-            segments = try store.segments(sessionId: session.id)
+            rawSegments = try store.segments(sessionId: session.id)
             fragments = try store.fragments(sessionId: session.id)
         } catch {
             return .failure(.store("failed reading inputs: \(String(describing: error))"))
@@ -86,9 +86,18 @@ public final class FusionService: Sendable {
 
         // Zero-fragment mode is normal (empty scratchpad, SPEC §4.5); an
         // empty TRANSCRIPT is not — fail fast instead of burning an API call.
-        guard !segments.isEmpty else {
+        guard !rawSegments.isEmpty else {
             return .failure(.emptyTranscript)
         }
+
+        // Deterministic cleanup runs BEFORE chunking, not just before
+        // rendering: a Whisper repetition loop can add thousands of words to
+        // a transcript, and word count is what decides whether this session
+        // costs one API call or four. Cleanup is idempotent, so
+        // `PromptAssembler.userPrompt` cleaning again is a no-op — and it
+        // never empties a non-empty transcript, so `.emptyTranscript` still
+        // means exactly what it meant before (no segments at all).
+        let segments = TranscriptCleanup.clean(rawSegments)
 
         let markdown: String
         do {
@@ -118,7 +127,10 @@ public final class FusionService: Sendable {
 
         // Parse + validate (deterministic, no model calls, SPEC §4.5).
         let title = PromptAssembler.extractTitle(from: markdown)
-        let findings = NotesValidator.validate(markdown: markdown, segments: segments)
+        // Validate against the RAW segments: the timeline (check a) must be
+        // the one the recogniser produced, and `NotesValidator` searches the
+        // cleaned rendering as well, so a quote taken from either resolves.
+        let findings = NotesValidator.validate(markdown: markdown, segments: rawSegments)
 
         // Keep every attempt; latest is canonical (SPEC §4.6).
         let note = NoteRecord(
@@ -170,10 +182,14 @@ public final class FusionService: Sendable {
     // MARK: Provider calls
 
     private func complete(input: FusionInput, provider: any FusionProvider) async throws -> String {
+        // The rendered transcript is a reusable prefix: a Retry after a
+        // validator finding or a transient failure re-sends these exact
+        // bytes, and so would a second pass over the same notes.
         try await provider.complete(
             systemPrompt: SystemPrompt.v1,
             userPrompt: PromptAssembler.userPrompt(for: input),
-            temperature: Self.temperature
+            temperature: Self.temperature,
+            userPromptIsReusablePrefix: true
         )
     }
 
@@ -201,10 +217,15 @@ public final class FusionService: Sendable {
             )
             chunkNotes.append(try await complete(input: input, provider: provider))
         }
+        // The compose message is unique to this one request (it carries the
+        // chunk notes this run just produced), so it is NOT a cacheable
+        // prefix — marking it would pay the cache-write premium for an entry
+        // no later request can read.
         return try await provider.complete(
             systemPrompt: SystemPrompt.v1,
             userPrompt: PromptAssembler.composeUserPrompt(chunkNotes: chunkNotes),
-            temperature: Self.temperature
+            temperature: Self.temperature,
+            userPromptIsReusablePrefix: false
         )
     }
 
