@@ -315,7 +315,7 @@ private actor Resolver {
             return (variant, SharedInferenceGate(engine: engine))
         }
         #endif
-        guard let folder = locateModelFolder(variant: variant) else {
+        guard let folder = WhisperModelLocator.locateModelFolder(variant: variant) else {
             logger.error("""
             Whisper model '\(variant, privacy: .public)' not found under the models root — \
             transcription is disabled this session (Settings → Whisper Model downloads it). \
@@ -324,13 +324,9 @@ private actor Resolver {
             return nil
         }
         do {
-            // `URL.path()` percent-ENCODES (macOS 13+), so "Application Support"
-            // reached WhisperKit as "Application%20Support" and every model load
-            // failed with modelsUnavailable — transcription silently disabled for
-            // the whole session. Ask for the decoded filesystem path explicitly.
             let engine = try await WhisperKitEngine(
                 modelName: variant,
-                modelFolder: folder.path(percentEncoded: false)
+                modelFolder: WhisperModelLocator.modelFolderArgument(folder)
             )
             logger.info("WhisperKit engine loaded for '\(variant, privacy: .public)' (lazy, first session start).")
             return (variant, SharedInferenceGate(engine: engine))
@@ -344,15 +340,49 @@ private actor Resolver {
         }
     }
 
-    /// Locates a downloaded variant's folder under
-    /// `ModelDownloadManager.defaultModelRoot`, mirroring the heuristic
-    /// `ModelDownloadManager.isDownloaded` uses: a compiled Core ML bundle
-    /// (`*.mlmodelc`) whose parent folder is the named variant (the Hub
-    /// cache nests it as `…/snapshots/<hash>/openai_whisper-<variant>/`).
+}
+
+// MARK: - Model location
+
+/// Where a downloaded Whisper variant lives on disk, and how that location is
+/// spelled for `WhisperKitEngine(modelFolder:)`.
+///
+/// Split out of `Resolver` (which is a private actor around a Core ML load,
+/// so nothing in it could ever be exercised) because BOTH halves of this
+/// have already shipped broken and both are pure string/filesystem work.
+enum WhisperModelLocator {
+
+    /// The filesystem path string to hand `WhisperKitEngine(modelFolder:)`.
+    ///
+    /// `URL.path()` percent-ENCODES (macOS 13+), so the default models root —
+    /// which lives under `~/Library/Application Support/…` — reached WhisperKit
+    /// as `Application%20Support`, no such directory existed, and every model
+    /// load failed with `modelsUnavailable`. Transcription was silently
+    /// disabled for months of real use. `path(percentEncoded: false)` is the
+    /// decoded filesystem spelling, which is the only thing a POSIX API can
+    /// open.
+    ///
+    /// The deprecated `.path` property is NOT the fix to reach for here: it is
+    /// deprecated precisely because callers kept confusing the two, and being
+    /// explicit is what the next reader needs to see.
+    static func modelFolderArgument(_ folder: URL) -> String {
+        folder.path(percentEncoded: false)
+    }
+
+    /// Locates a downloaded variant's folder under `root`, mirroring the
+    /// heuristic `ModelDownloadManager.isDownloaded` uses: a compiled Core ML
+    /// bundle (`*.mlmodelc`) whose parent folder is named for the variant (the
+    /// Hub cache nests it as `…/snapshots/<hash>/openai_whisper-<variant>/`).
     /// Returns the variant folder for `WhisperKitEngine(modelFolder:)`.
-    private static func locateModelFolder(variant: String) -> URL? {
+    ///
+    /// `root` is a parameter only so this can be pointed at a fixture tree;
+    /// every app path takes the default.
+    static func locateModelFolder(
+        root: URL = ModelDownloadManager.defaultModelRoot,
+        variant: String
+    ) -> URL? {
         guard let enumerator = FileManager.default.enumerator(
-            at: ModelDownloadManager.defaultModelRoot,
+            at: root,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return nil }

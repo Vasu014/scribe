@@ -551,12 +551,6 @@ final class HistoryWindowController: NSObject {
 
     // MARK: - Data
 
-    /// Sidebar row state, DERIVED at display time (SPEC §5): storage states
-    /// stay `recording | processing | complete` on the rows.
-    private enum RowState {
-        case recording, fused, fusing, failed
-    }
-
     /// Why the last fusion attempt failed, or `nil` if it did not.
     ///
     /// Two sources, in priority order: the live `fusionFailed` event for this
@@ -570,16 +564,12 @@ final class HistoryWindowController: NSObject {
         fusionFailures[session.id] ?? session.fusionErrorMessage
     }
 
-    private func rowState(_ session: SessionRecord) -> RowState {
-        switch session.state {
-        case .recording:
-            return .recording
-        case .complete:
-            return .fused
-        case .processing:
-            if failureMessage(for: session) != nil { return .failed } // SPEC §5: processing + last error
-            return notePresence.contains(session.id) ? .fused : .fusing // findings keep a stored note
-        }
+    private func rowState(_ session: SessionRecord) -> HistoryRow.State {
+        HistoryRow.state(
+            storage: session.state,
+            failureMessage: failureMessage(for: session),
+            hasStoredNote: notePresence.contains(session.id)
+        )
     }
 
     /// Reloads the list (and, when its inputs changed, the detail). Selection
@@ -1196,7 +1186,7 @@ final class HistoryWindowController: NSObject {
     }
 
     /// Filesystem-safe export name (≤60 chars before the extension).
-    private static func fileName(for title: String, extension ext: String) -> String {
+    static func fileName(for title: String, extension ext: String) -> String {
         let invalid = CharacterSet(charactersIn: "/\\:?%*|\"<>\n\r\t")
         let cleaned = title.components(separatedBy: invalid)
             .joined(separator: " ")
@@ -1295,29 +1285,12 @@ extension HistoryWindowController: NSTableViewDataSource, NSTableViewDelegate {
         cell.identifier = Self.cellIdentifier
 
         let state = rowState(session)
-        let meta: String
-        var metaColor = NSColor.secondaryLabelColor
-        switch state {
-        case .fused:
-            meta = durationText(session) ?? ""
-        case .recording:
-            meta = "recording"
-        case .fusing:
-            meta = "fusing"
-        case .failed:
-            meta = "failed"
-            metaColor = HistoryMeta.failureColor // design: #E0483E
-        }
         cell.configure(
-            // NOT `fallbackTitle` (date · duration): this row already prints
-            // the date on line 2 and the duration in its own meta column, so
-            // the SPEC §4.5 fallback rendered as "Today, 8:30 AM · 1 min"
-            // stacked directly on top of "Today, 8:30 AM". The detail pane,
-            // which has no such columns, still uses the spec'd form.
-            title: session.title?.isEmpty == false ? session.title! : HistoryMeta.untitledRowTitle,
+            title: HistoryRow.title(session),
             dateText: HistoryMeta.dateAndTime(session.startedAt),
-            meta: meta,
-            metaColor: metaColor,
+            meta: HistoryRow.meta(for: state, duration: durationText(session)),
+            // design: #E0483E, dark-mode aware (see HistoryMeta.failureColor).
+            metaColor: state == .failed ? HistoryMeta.failureColor : .secondaryLabelColor,
             isFusing: state == .fusing,
             isRecovered: session.recovered
         )
@@ -1666,7 +1639,7 @@ private final class SessionCellView: NSTableCellView {
 
 /// History text helpers (design 1d). Wall-clock based (SPEC §4.1 — durations
 /// derive from wall clock, never the session clock).
-private enum HistoryMeta {
+enum HistoryMeta {
     /// Failure text token (design 1d #E0483E). Dynamic: #E0483E reads as mud
     /// on a dark background, so dark mode falls back to `systemRed`.
     static let failureColor = NSColor(name: "scribe.history.failure") { appearance in
@@ -1835,3 +1808,66 @@ private enum HistoryGlyphs {
     }
 }
 
+
+// MARK: - Sidebar row derivation (pure)
+
+/// What one sidebar row says about a session (design 1d; SPEC §5).
+///
+/// Split out of `HistoryWindowController` — which needs a window, a table
+/// view and an open GRDB store to exist — because the row is where the
+/// storage state, the last fusion outcome and the note's presence are folded
+/// into one word, and all three of those have been wrong in shipped builds.
+enum HistoryRow {
+
+    /// Row state, DERIVED at display time (SPEC §5): storage states stay
+    /// `recording | processing | complete` on the rows themselves.
+    enum State: Equatable {
+        case recording, fused, fusing, failed
+    }
+
+    /// `failureMessage` is the live-event-or-persisted-column value (see
+    /// `HistoryWindowController.failureMessage(for:)`) and `hasStoredNote`
+    /// is whether the store holds a canonical note for the session.
+    ///
+    /// The `processing` case is the whole point. `processing` alone cannot
+    /// tell "still fusing" from "failed permanently", and when the reason
+    /// lived only in memory a failed meeting came back from a relaunch as a
+    /// spinner that would never stop. A stored note under `processing` means
+    /// fusion succeeded WITH validator findings — that row is fused, and
+    /// Retry stays available; it is not a failure.
+    static func state(storage: SessionState, failureMessage: String?, hasStoredNote: Bool) -> State {
+        switch storage {
+        case .recording:
+            return .recording
+        case .complete:
+            return .fused
+        case .processing:
+            if failureMessage != nil { return .failed } // SPEC §5: processing + last error
+            return hasStoredNote ? .fused : .fusing // findings keep a stored note
+        }
+    }
+
+    /// The row's meta column. Only a fused row shows a duration, and a
+    /// recovered session has no end (SPEC §4.4) so its duration is `nil` —
+    /// an empty column, never an invented number.
+    static func meta(for state: State, duration: String?) -> String {
+        switch state {
+        case .fused: return duration ?? ""
+        case .recording: return "recording"
+        case .fusing: return "fusing"
+        case .failed: return "failed"
+        }
+    }
+
+    /// The row's title line.
+    ///
+    /// NOT `HistoryMeta.fallbackTitle` (date · duration): this row already
+    /// prints the date on line 2 and the duration in its own meta column, so
+    /// the SPEC §4.5 fallback rendered as "Today, 8:30 AM · 1 min" stacked
+    /// directly on top of "Today, 8:30 AM". The detail pane, which has no
+    /// such columns, still uses the spec'd form.
+    static func title(_ session: SessionRecord) -> String {
+        guard let title = session.title, !title.isEmpty else { return HistoryMeta.untitledRowTitle }
+        return title
+    }
+}

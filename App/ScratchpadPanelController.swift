@@ -178,7 +178,9 @@ private final class HUDButton: NSButton {
 /// composer freezes the row and the view clears — a line break is never
 /// inserted. Placeholder (design 2a, white 32%) is drawn by hand; NSTextView
 /// has none.
-private final class BodyTextView: NSTextView {
+/// Internal (not `private`) so the TextKit stack this initializer builds can
+/// be verified without a panel on screen — see `init()`.
+final class BodyTextView: NSTextView {
 
     /// Fired for Enter (and its editor variants); the controller freezes the
     /// burst and clears the view.

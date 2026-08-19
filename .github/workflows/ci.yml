@@ -27,3 +27,9 @@ jobs:
 
       - name: Build app (unsigned)
         run: set -o pipefail && xcodebuild -project Scribe.xcodeproj -scheme Scribe build CODE_SIGNING_ALLOWED=NO 2>&1 | tail -5
+
+      # App-layer unit tests. Headless: the target compiles App/ sources into
+      # the test bundle rather than hosting the app, so there is no window
+      # server, no TCC and no status item involved.
+      - name: App tests
+        run: set -o pipefail && xcodebuild test -project Scribe.xcodeproj -scheme Scribe -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO 2>&1 | tail -5

@@ -398,11 +398,12 @@ final class MenuBarController: NSObject {
         // gains Retry Fusion"; SPEC §5 failed → persistent ⚠, retry
         // available). It stays through the ⚠ being acknowledged, because
         // opening the menu clears the badge but not the failure.
-        retryItem.isHidden = !isFailedState
-        retryItem.isEnabled = isFailedState
+        let showsRetry = MenuBarPresentation.retryFusionIsVisible(in: displayState)
+        retryItem.isHidden = !showsRetry
+        retryItem.isEnabled = showsRetry
 
         // Open Notes rides the done transient only (see buildMenu).
-        if case .done = displayState {
+        if MenuBarPresentation.openNotesIsVisible(in: displayState) {
             notesItem.isHidden = false
             notesItem.isEnabled = onOpenHistory != nil
         } else {
@@ -414,7 +415,7 @@ final class MenuBarController: NSObject {
             let paragraph = NSMutableParagraphStyle()
             paragraph.tabStops = [NSTextTab(textAlignment: .right, location: 175)]
             let title = NSMutableAttributedString(
-                string: "Stop Meeting",
+                string: MenuBarPresentation.startStopTitle(in: displayState),
                 attributes: [.font: NSFont.menuFont(ofSize: 13), .paragraphStyle: paragraph]
             )
             title.append(NSAttributedString(
@@ -432,12 +433,12 @@ final class MenuBarController: NSObject {
             // the hands-on-keyboard stop (Return) for the rest of the time.
             // Deliberately not ⌘, / ⌘Q / ⌥⌘N: those belong to the main menu
             // and the global hotkey.
-            startStopItem.keyEquivalent = "."
+            startStopItem.keyEquivalent = MenuBarPresentation.startStopKeyEquivalent(in: displayState)
             startStopItem.keyEquivalentModifierMask = [.command]
         } else {
             startStopItem.attributedTitle = nil
-            startStopItem.title = "Start Meeting"
-            startStopItem.keyEquivalent = ""
+            startStopItem.title = MenuBarPresentation.startStopTitle(in: displayState)
+            startStopItem.keyEquivalent = MenuBarPresentation.startStopKeyEquivalent(in: displayState)
         }
         startStopItem.isEnabled = true // Start from idle/processing/failed; Stop while recording
     }
@@ -509,17 +510,9 @@ final class MenuBarController: NSObject {
 
     /// Right-click / Control-click → menu; anything else (including a
     /// keyboard-driven `performClick`, which carries no event) → the badge's
-    /// advertised action.
+    /// advertised action. See `MenuBarPresentation.clickWantsMenu`.
     private static func clickWantsMenu(_ event: NSEvent?) -> Bool {
-        guard let event else { return false }
-        switch event.type {
-        case .rightMouseDown, .rightMouseUp:
-            return true
-        case .leftMouseDown, .leftMouseUp:
-            return event.modifierFlags.contains(.control)
-        default:
-            return false
-        }
+        MenuBarPresentation.clickWantsMenu(event)
     }
 
     /// Pops the ordinary menu while the done badge owns the button.
@@ -569,11 +562,6 @@ final class MenuBarController: NSObject {
         case .fusionFindings, .fusionFailed, .deviceEventLogged, .transcriptDrainTimedOut:
             break // logged by ScribeApp; surfaced in History (T7)
         }
-    }
-
-    private var isFailedState: Bool {
-        if case .failed = displayState { return true }
-        return false
     }
 
     private func transition(to state: SessionDisplayState) {
@@ -653,9 +641,12 @@ final class MenuBarController: NSObject {
     /// Reverts the transient done badge to idle (SPEC §5: done auto-returns
     /// to idle; storage is already `complete` — display-only transition).
     private func endDoneTransient() {
-        guard case .done = displayState else { return }
-        displayState = .idle
-        applyVisual(for: .idle)
+        // The revert is a 4 s timer, so by the time it lands the user may
+        // already have started the NEXT meeting off the badge; only a state
+        // that is STILL `.done` may be reverted.
+        guard let next = MenuBarPresentation.stateAfterDoneHold(displayState) else { return }
+        displayState = next
+        applyVisual(for: next)
         if isMenuOpen {
             updateMenuContent()
         }
@@ -745,24 +736,12 @@ final class MenuBarController: NSObject {
     /// Idle label. Spelled "not recording" on purpose: SPEC §5's consent
     /// posture ("the recording indicator is ALWAYS visible") only holds for
     /// a VoiceOver user if idle and recording are told apart by ear.
-    static let idleLabel = "Scribe — idle, not recording"
+    static let idleLabel = MenuBarPresentation.idleLabel
 
-    /// Elapsed clock in speech, not digits: the capsule's "24:16" is read
-    /// "twenty-four sixteen" (or worse) by speech synthesis, so the label
-    /// carries "24 minutes 16 seconds".
+    /// Elapsed clock in speech, not digits — see
+    /// `MenuBarPresentation.spokenElapsed`.
     static func spokenElapsed(_ interval: TimeInterval) -> String {
-        let total = max(0, Int(interval.rounded(.down)))
-        let hours = total / 3_600
-        let minutes = (total % 3_600) / 60
-        let seconds = total % 60
-        func unit(_ value: Int, _ name: String) -> String {
-            "\(value) \(name)\(value == 1 ? "" : "s")"
-        }
-        var parts: [String] = []
-        if hours > 0 { parts.append(unit(hours, "hour")) }
-        if minutes > 0 { parts.append(unit(minutes, "minute")) }
-        if seconds > 0 || parts.isEmpty { parts.append(unit(seconds, "second")) }
-        return parts.joined(separator: " ")
+        MenuBarPresentation.spokenElapsed(interval)
     }
 
     /// Labels the status button for the given derived state. Called from
@@ -774,36 +753,20 @@ final class MenuBarController: NSObject {
     /// `AXValue` repeats the clock alone so a client can poll just that.
     private func updateAccessibility(for state: SessionDisplayState) {
         guard let button = statusItem.button else { return }
-        button.setAccessibilityHelp(nil)
-        button.setAccessibilityCustomActions([])
-        switch state {
-        case .idle:
-            lastAccessibleElapsed = ""
-            button.setAccessibilityLabel(Self.idleLabel)
-            button.setAccessibilityValue(nil)
-        case .recording:
-            let elapsed = coordinator.elapsed()
-            lastAccessibleElapsed = Formatting.elapsedString(elapsed)
-            let spoken = Self.spokenElapsed(elapsed)
-            button.setAccessibilityLabel("Scribe — recording, \(spoken)")
-            button.setAccessibilityValue(spoken)
-        case .processing:
-            lastAccessibleElapsed = ""
-            button.setAccessibilityLabel("Scribe — processing notes")
-            button.setAccessibilityValue(nil)
-        case .done(let sessionId):
-            lastAccessibleElapsed = ""
-            button.setAccessibilityLabel("Scribe — notes ready")
-            button.setAccessibilityValue(nil)
-            // The badge is a click target for 4 s; say what the click does
-            // and that the menu is still one right-click away, and offer
-            // the same thing as a VoiceOver action (VO ⌃⌥⌘-Space) since a
-            // VoiceOver user cannot right-click a status item.
-            button.setAccessibilityHelp(
-                "Opens these notes in History. Right-click or Control-click for the Scribe menu."
-            )
+        let elapsed = state == .recording ? coordinator.elapsed() : 0
+        lastAccessibleElapsed = state == .recording ? Formatting.elapsedString(elapsed) : ""
+
+        let announcement = MenuBarPresentation.announcement(for: state, elapsed: elapsed)
+        button.setAccessibilityLabel(announcement.label)
+        button.setAccessibilityValue(announcement.value)
+        button.setAccessibilityHelp(announcement.help)
+
+        // The done badge is a click target for 4 s, and a VoiceOver user
+        // cannot right-click a status item — so the same thing is offered as
+        // a custom action (VO ⌃⌥⌘-Space). Only this state carries one.
+        if case .done(let sessionId) = state {
             button.setAccessibilityCustomActions([
-                NSAccessibilityCustomAction(name: "Open notes in History") { [weak self] in
+                NSAccessibilityCustomAction(name: MenuBarPresentation.openNotesActionName) { [weak self] in
                     MainActor.assumeIsolated {
                         guard let self else { return false }
                         self.openDoneSession(sessionId)
@@ -811,11 +774,8 @@ final class MenuBarController: NSObject {
                     }
                 },
             ])
-        case .failed:
-            lastAccessibleElapsed = ""
-            button.setAccessibilityLabel("Scribe — fusion failed")
-            button.setAccessibilityValue(nil)
-            button.setAccessibilityHelp("Open the Scribe menu and choose Retry Fusion.")
+        } else {
+            button.setAccessibilityCustomActions([])
         }
     }
 }
@@ -993,4 +953,154 @@ private enum StatusGlyphs {
         image.unlockFocus()
         return image
     }()
+}
+
+// MARK: - Derived presentation (pure)
+
+/// Everything the menu bar shows, derived from `SessionDisplayState` alone
+/// (SPEC §5) with no AppKit state involved.
+///
+/// Split out of `MenuBarController` because that controller cannot be built
+/// without a live `NSStatusItem` and a real `SessionCoordinator`: the status
+/// item is not a window, the menu bar auto-hides, and driving VoiceOver from
+/// a script needs Accessibility trust CI does not have. That is exactly why
+/// this mapping has only ever been checked by eye — see the `-a11yProbe`
+/// harness above, which was built because nothing else could see it.
+///
+/// Everything here is a pure function of the derived state, so it IS
+/// checkable, and `MenuBarController` calls into it rather than restating
+/// any of it.
+enum MenuBarPresentation {
+
+    // MARK: Menu items
+
+    /// SPEC §5 / design 1a: the failure state — and only the failure state —
+    /// "gains Retry Fusion". It must not linger into `idle` after the ⚠ has
+    /// been acknowledged, and it must not be offered while a fusion the user
+    /// cannot yet judge is still in flight.
+    static func retryFusionIsVisible(in state: SessionDisplayState) -> Bool {
+        if case .failed = state { return true }
+        return false
+    }
+
+    /// "Open Notes" rides the 4 s done transient only — it is the keyboard
+    /// and VoiceOver path to the badge's click target (finding 9), and it
+    /// points at a specific session id, so it is meaningless in every other
+    /// state.
+    static func openNotesIsVisible(in state: SessionDisplayState) -> Bool {
+        if case .done = state { return true }
+        return false
+    }
+
+    static let openNotesActionName = "Open notes in History"
+
+    /// The one meeting action: Stop while recording, Start otherwise —
+    /// including from `processing` and `failed`, where a previous meeting is
+    /// still being fused but a new one may begin.
+    static func startStopTitle(in state: SessionDisplayState) -> String {
+        state == .recording ? "Stop Meeting" : "Start Meeting"
+    }
+
+    /// ⌘. (the macOS stop/cancel idiom) is advertised only while there is
+    /// something to stop; a status-menu key equivalent fires only while the
+    /// menu is tracking, so leaving it attached to "Start Meeting" would put
+    /// a dead shortcut on screen.
+    static func startStopKeyEquivalent(in state: SessionDisplayState) -> String {
+        state == .recording ? "." : ""
+    }
+
+    // MARK: Done transient
+
+    /// The state the 4 s done badge reverts to, or `nil` when it must not
+    /// revert at all.
+    ///
+    /// The revert is a timer, and 4 s is long enough for the user to have
+    /// clicked the badge (which ends the transient early) or started the next
+    /// meeting off it. A revert that fired unconditionally would drop a live
+    /// `recording` capsule back to the idle waveform while the mic was open —
+    /// which is the one thing SPEC §5's consent posture forbids.
+    static func stateAfterDoneHold(_ current: SessionDisplayState) -> SessionDisplayState? {
+        if case .done = current { return .idle }
+        return nil
+    }
+
+    /// Right-click / Control-click on the done badge → the menu; anything
+    /// else — including a keyboard-driven `performClick`, which carries no
+    /// event at all — → the badge's advertised action (open the notes).
+    static func clickWantsMenu(_ event: NSEvent?) -> Bool {
+        guard let event else { return false }
+        switch event.type {
+        case .rightMouseDown, .rightMouseUp:
+            return true
+        case .leftMouseDown, .leftMouseUp:
+            return event.modifierFlags.contains(.control)
+        default:
+            return false
+        }
+    }
+
+    // MARK: Accessibility
+
+    /// Idle label. Spelled "not recording" on purpose: SPEC §5's consent
+    /// posture ("the recording indicator is ALWAYS visible") only holds for
+    /// a VoiceOver user if idle and recording are told apart by ear.
+    static let idleLabel = "Scribe — idle, not recording"
+
+    /// What an assistive client reads off the status button.
+    struct Announcement: Equatable {
+        /// `AXLabel` — carries state AND data, because clients that ignore
+        /// `AXValue` on a menu-bar element must still get the elapsed.
+        let label: String
+        /// `AXValue` — the clock alone, so a client can poll just that.
+        let value: String?
+        /// `AXHelp` — only where there is something non-obvious to do.
+        let help: String?
+    }
+
+    /// Elapsed clock in speech, not digits: the capsule's "24:16" is read
+    /// "twenty-four sixteen" (or worse) by speech synthesis, so the label
+    /// carries "24 minutes 16 seconds". Zero-valued components are dropped,
+    /// except that a zero total still has to say something.
+    static func spokenElapsed(_ interval: TimeInterval) -> String {
+        let total = max(0, Int(interval.rounded(.down)))
+        let hours = total / 3_600
+        let minutes = (total % 3_600) / 60
+        let seconds = total % 60
+        func unit(_ value: Int, _ name: String) -> String {
+            "\(value) \(name)\(value == 1 ? "" : "s")"
+        }
+        var parts: [String] = []
+        if hours > 0 { parts.append(unit(hours, "hour")) }
+        if minutes > 0 { parts.append(unit(minutes, "minute")) }
+        if seconds > 0 || parts.isEmpty { parts.append(unit(seconds, "second")) }
+        return parts.joined(separator: " ")
+    }
+
+    /// Every derived state carries its OWN label: the elapsed clock and
+    /// "Notes ready" are pixels inside a bitmap, and the ⚠ is colour alone
+    /// (finding 21), so without this the whole surface reads as an unlabeled
+    /// "button" (blocker 10).
+    static func announcement(for state: SessionDisplayState, elapsed: TimeInterval) -> Announcement {
+        switch state {
+        case .idle:
+            return Announcement(label: idleLabel, value: nil, help: nil)
+        case .recording:
+            let spoken = spokenElapsed(elapsed)
+            return Announcement(label: "Scribe — recording, \(spoken)", value: spoken, help: nil)
+        case .processing:
+            return Announcement(label: "Scribe — processing notes", value: nil, help: nil)
+        case .done:
+            return Announcement(
+                label: "Scribe — notes ready",
+                value: nil,
+                help: "Opens these notes in History. Right-click or Control-click for the Scribe menu."
+            )
+        case .failed:
+            return Announcement(
+                label: "Scribe — fusion failed",
+                value: nil,
+                help: "Open the Scribe menu and choose Retry Fusion."
+            )
+        }
+    }
 }

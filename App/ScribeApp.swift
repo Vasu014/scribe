@@ -773,17 +773,45 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
     /// the menu simply appears in the menu bar during the moments the app is
     /// already frontmost.
     private func installMainMenu() {
+        let (mainMenu, windowMenu) = Self.makeMainMenu(
+            appName: ProcessInfo.processInfo.processName,
+            settingsTarget: self,
+            settingsAction: #selector(openSettingsFromMainMenu)
+        )
+        NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
+
+        // The menu must never buy itself a Dock icon: LSUIElement is in
+        // Info.plist and `main()` sets `.accessory`, but assert it here
+        // because this is the code that could plausibly change it.
+        if NSApp.activationPolicy() != .accessory {
+            logger.fault("Activation policy is not .accessory after installing the main menu — restoring it.")
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+    /// Builds the App / Edit / Window menus, without installing them.
+    ///
+    /// Separated from `installMainMenu()` so the menu's CONTENTS can be
+    /// checked without a running `NSApplication`: the shipped defect here was
+    /// not a wrong item, it was an absent Edit menu, and "did ⌘V paste"
+    /// cannot be answered by looking at a screenshot of a text field.
+    /// Returns the Window submenu too — it is what `NSApp.windowsMenu` wants.
+    static func makeMainMenu(
+        appName: String,
+        settingsTarget: AnyObject?,
+        settingsAction: Selector
+    ) -> (main: NSMenu, window: NSMenu) {
         let mainMenu = NSMenu()
-        let appName = ProcessInfo.processInfo.processName
 
         // App menu. Its title is ignored by AppKit (the app name is drawn),
         // but the submenu's own title is what VoiceOver announces.
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: appName)
         let settings = NSMenuItem(
-            title: "Settings…", action: #selector(openSettingsFromMainMenu), keyEquivalent: ","
+            title: "Settings…", action: settingsAction, keyEquivalent: ","
         )
-        settings.target = self
+        settings.target = settingsTarget
         appMenu.addItem(settings)
         appMenu.addItem(.separator())
         // target nil → the responder chain reaches NSApplication.terminate,
@@ -847,16 +875,7 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
 
-        NSApp.mainMenu = mainMenu
-        NSApp.windowsMenu = windowMenu
-
-        // The menu must never buy itself a Dock icon: LSUIElement is in
-        // Info.plist and `main()` sets `.accessory`, but assert it here
-        // because this is the code that could plausibly change it.
-        if NSApp.activationPolicy() != .accessory {
-            logger.fault("Activation policy is not .accessory after installing the main menu — restoring it.")
-            NSApp.setActivationPolicy(.accessory)
-        }
+        return (mainMenu, windowMenu)
     }
 
     /// App-menu Settings… — deliberately the same handler the status-item
