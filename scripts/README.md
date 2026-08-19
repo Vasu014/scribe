@@ -1,8 +1,43 @@
 # Scribe scripts
 
 `dev.sh` — contributor one-liner (project generation + package tests + app
-build). `release.sh` — the signed-release pipeline (SPEC §6). Neither is
-committed-output dependent; both are safe to run from a fresh clone.
+build). `release.sh` — the signed-release pipeline (SPEC §6). `ui-gallery.sh`
+— UI screenshot harness (below). None is committed-output dependent; all are
+safe to run from a fresh clone.
+
+## ui-gallery.sh — UI screenshots for design diffing
+
+```bash
+make build                       # DerivedData Debug build the harness shoots
+./scripts/ui-gallery.sh          # → /tmp/scribe-ui/<scene>.png (dir overridable: $1)
+```
+
+Launches the built app with `-uiGallery YES`, which makes
+`ScribeApp.applicationDidFinishLaunching` hand over to `App/UIGallery.swift`
+instead of doing the real wiring (no wizard, no Sparkle, no capture engine, no
+TCC prompts). The gallery seeds an in-memory store with the fixtures from
+`design/README.md` §3, opens every surface as its own window, prints
+`GALLERY<TAB>scene<TAB>value` lines, and the script captures each one.
+Scenes: `history-notes`, `history-transcript`, `history-empty`, `settings`,
+`scratchpad-recording`, `scratchpad-empty`, `scratchpad-no-meeting`,
+`wizard-welcome`, `menubar-states`, `menubar-region`.
+
+`value` is a window number (window capture), an `x,y,w,h` region (screen
+capture), or `file:<path>` for a scene the app rendered itself.
+
+The menu bar item has two scenes because a status item is not a window:
+
+- `menubar-states` — the app draws the REAL status-item artwork for all five
+  states (idle / recording / processing / done / failed) onto a simulated
+  design-1a menu bar strip and writes the PNG; the script just collects it.
+  Needs no permissions and works with the menu bar hidden.
+- `menubar-region` — a `screencapture -R` of the live item: ground truth, but
+  only with a visible menu bar (Control Center › "Automatically hide and show
+  the menu bar" off) and nothing covering the strip. It is a WARN, not a
+  failure, when it comes back blank.
+
+Requirements: the Screen Recording permission for whatever runs the script
+(every window scene needs it).
 
 ## release.sh env contract
 
