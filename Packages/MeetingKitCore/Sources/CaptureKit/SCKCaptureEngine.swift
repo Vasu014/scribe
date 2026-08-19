@@ -4,6 +4,7 @@ import CoreGraphics
 import CoreMedia
 import Darwin
 import Foundation
+import os
 import Persistence
 import ScreenCaptureKit
 
@@ -215,6 +216,10 @@ public final class SCKCaptureEngine: NSObject, CaptureEngine, @unchecked Sendabl
     /// Per-channel 16 kHz downsamplers — processingQueue-confined only.
     private var downsamplers: [Channel: PCMDownsampler] = [:]
 
+    /// Per-channel capture-side VAD gates — processingQueue-confined only
+    /// (item 20: skip the resample for silence, see `SilenceGate`).
+    private var silenceGates: [Channel: SilenceGate] = [:]
+
     // MARK: Init
 
     public init(config: Configuration = Configuration()) {
@@ -300,6 +305,11 @@ public final class SCKCaptureEngine: NSObject, CaptureEngine, @unchecked Sendabl
         }
         guard hadAnything else { return } // safe when stopped (protocol doc)
         _ = bumpGeneration() // drop in-flight callbacks from the stopped session
+        processingQueue.async { [weak self] in
+            self?.logGateSummary()
+            self?.silenceGates.removeAll()
+            self?.downsamplers.removeAll()
+        }
         await teardownRemote()
         await onStateQueue { self.expectingTeardown = false }
     }
@@ -369,7 +379,10 @@ public final class SCKCaptureEngine: NSObject, CaptureEngine, @unchecked Sendabl
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         audioEngine = nil
-        processingQueue.async { [weak self] in self?.downsamplers[.local] = nil }
+        processingQueue.async { [weak self] in
+            self?.downsamplers[.local] = nil
+            self?.silenceGates[.local]?.reset()
+        }
     }
 
     private func micFormatDescription() async -> String {
@@ -503,12 +516,58 @@ public final class SCKCaptureEngine: NSObject, CaptureEngine, @unchecked Sendabl
             downsampler = fresh
         }
 
-        let samples = downsampler.convert(buffer)
+        // Stage 1 (cheap, and needed for the VAD decision anyway): mixdown.
+        let mono = downsampler.monoAtSourceRate(buffer)
+        guard !mono.isEmpty else { return }
+
+        // VAD GATE, upstream of the resampler (SPEC §4.2 — TranscribeKit
+        // already refuses to decode silence; what it could not refuse was the
+        // conversion + allocation + actor hop that happened before it ever saw
+        // the samples). Silence outside the hangover stops here: no resample,
+        // no `[Float]`, no `onAudio`. See `SilenceGate` for why this cannot
+        // drop speech.
+        let gate = silenceGate(for: channel, sampleRate: buffer.format.sampleRate)
+        guard let admitted = gate.admit(mono) else { return }
+
+        // Stage 2: the expensive half, now paid only for audio that matters.
+        let samples = downsampler.convertMono(admitted.samples)
         guard !samples.isEmpty else { return }
+
+        // Pre-roll was captured BEFORE this buffer arrived, so the emitted
+        // chunk starts that much earlier on the session clock. Without this
+        // correction every segment after a silence would be stamped late.
+        let prerollLead = Double(admitted.prerollSamples) / buffer.format.sampleRate
         onAudio?(CapturedSample(channel: channel,
-                                sessionOffset: sessionOffset,
+                                sessionOffset: max(0, sessionOffset - prerollLead),
                                 sampleRate: PCMDownsampler.targetSampleRate,
                                 samples: samples))
+    }
+
+    /// Per-channel gate, rebuilt whenever the source rate changes (device
+    /// switch) so retained pre-roll can never be prepended at the wrong rate.
+    private func silenceGate(for channel: Channel, sampleRate: Double) -> SilenceGate {
+        if let existing = silenceGates[channel], existing.sampleRate == sampleRate {
+            return existing
+        }
+        let fresh = SilenceGate(sampleRate: sampleRate)
+        silenceGates[channel] = fresh
+        return fresh
+    }
+
+    /// ProcessingQueue-confined. One line per channel at stop: how much of
+    /// the session never reached the resampler. A gate that ate a meeting (wrong threshold, dead mic
+    /// levels) shows up here as ~100 % skipped with zero openings, instead of
+    /// as an empty transcript minutes later (T10 dogfood convention).
+    private func logGateSummary() {
+        for (channel, gate) in silenceGates {
+            Logger(subsystem: "io.github.vasu014.scribe", category: "capture").info("""
+            VAD gate summary [\(String(describing: channel), privacy: .public)]: \
+            skipped=\(String(format: "%.1f", gate.skipRatio * 100), privacy: .public)% \
+            admitted=\(String(format: "%.1f", Double(gate.admittedSamples) / gate.sampleRate), privacy: .public)s \
+            silent=\(String(format: "%.1f", Double(gate.skippedSamples) / gate.sampleRate), privacy: .public)s \
+            openings=\(gate.openings, privacy: .public)
+            """)
+        }
     }
 
     /// Called by `RemoteAudioRelay` on `processingQueue`.

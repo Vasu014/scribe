@@ -1,3 +1,4 @@
+import Accelerate
 import AVFAudio
 import Foundation
 
@@ -36,25 +37,28 @@ public enum PCMConversion {
         }
 
         var mixed = [Float](repeating: 0, count: frames)
-        let scale = 1 / Float(channels)
+        var scale = 1 / Float(channels)
 
-        if buffer.format.isInterleaved {
-            // One buffer, frames laid out L R L R … — pointer math, no copies.
-            let interleaved = UnsafeBufferPointer(start: channelData[0], count: frames * channels)
-            for frame in 0..<frames {
-                var sum: Float = 0
+        // vDSP rather than scalar loops: this runs on EVERY captured buffer of
+        // every channel for the whole session (2 × 48 000 adds a second before
+        // anything else happens), so it is the one piece of the always-on path
+        // that has to be SIMD.
+        mixed.withUnsafeMutableBufferPointer { destination in
+            let out = destination.baseAddress!
+            if buffer.format.isInterleaved {
+                // One block, frames laid out L R L R … — strided accumulate.
                 for channel in 0..<channels {
-                    sum += interleaved[frame * channels + channel]
+                    vDSP_vadd(out, 1,
+                              channelData[0] + channel, vDSP_Stride(channels),
+                              out, 1, vDSP_Length(frames))
                 }
-                mixed[frame] = sum * scale
+            } else {
+                // One pointer per channel; accumulate channel-wise.
+                for channel in 0..<channels {
+                    vDSP_vadd(out, 1, channelData[channel], 1, out, 1, vDSP_Length(frames))
+                }
             }
-        } else {
-            // One pointer per channel; accumulate channel-wise (cache-friendly).
-            for channel in 0..<channels {
-                let src = UnsafeBufferPointer(start: channelData[channel], count: frames)
-                for frame in 0..<frames { mixed[frame] += src[frame] }
-            }
-            for frame in 0..<frames { mixed[frame] *= scale }
+            vDSP_vsmul(out, 1, &scale, out, 1, vDSP_Length(frames))
         }
         return mixed
     }
@@ -132,10 +136,21 @@ public final class PCMDownsampler: @unchecked Sendable {
     /// `frames × ratio`; the tail surfaces in subsequent calls (or via
     /// `flush()` at end of stream).
     public func convert(_ input: AVAudioPCMBuffer) -> [Float] {
-        guard input.frameLength > 0 else { return [] }
+        convertMono(monoAtSourceRate(input))
+    }
 
-        // Stage 1: explicit mono mixdown at the source rate.
-        let mono = PCMConversion.monoSamples(from: input)
+    /// Stage 1 alone: explicit mono mixdown, still at the SOURCE rate.
+    ///
+    /// Split out so the engine can make its speech/silence decision (see
+    /// `SilenceGate`) BEFORE paying for stage 2 — the resample is the
+    /// expensive half and used to run on every silent buffer.
+    public func monoAtSourceRate(_ input: AVAudioPCMBuffer) -> [Float] {
+        guard input.frameLength > 0 else { return [] }
+        return PCMConversion.monoSamples(from: input)
+    }
+
+    /// Stage 2 alone: mono at the source rate → 16 kHz mono.
+    public func convertMono(_ mono: [Float]) -> [Float] {
         guard !mono.isEmpty,
               let scratch = scratchBuffer(frameCount: mono.count) else { return [] }
         _ = mono.withUnsafeBufferPointer { source in

@@ -153,6 +153,12 @@ final class PersistenceTests: XCTestCase {
 
     /// The kill-test: a second connection on the same file must see every
     /// committed row without the first connection closing (WAL durability).
+    ///
+    /// Segment writes are BATCHED since item 25, so "committed" now means
+    /// "committed within the SPEC §4.4 5 s bound" rather than "committed
+    /// before this line runs" — the wait below is that bound, and the test
+    /// still fails if a row never lands, lands late, or lands twice.
+    /// `SegmentBatchingTests` covers the bound itself in detail.
     func testCommittedRowsSurviveWithoutClose() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("scribe-tests-\(UUID().uuidString)", isDirectory: true)
@@ -168,6 +174,14 @@ final class PersistenceTests: XCTestCase {
 
         let reopened = try MeetingStore(path: path)  // recovery path
         XCTAssertEqual(try reopened.schemaVersion, 2)
+
+        // Wait out the persistence bound WITHOUT touching `crashed` — a real
+        // crash gets no flush, no close and no deinit.
+        let deadline = Date().addingTimeInterval(SegmentBatchPolicy.specPersistenceBound)
+        while try reopened.segmentCount(sessionId: session.id) == 0, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
         XCTAssertEqual(try reopened.segmentCount(sessionId: session.id), 1)
         XCTAssertEqual(try reopened.segments(sessionId: session.id)[0].text, "hello")
     }

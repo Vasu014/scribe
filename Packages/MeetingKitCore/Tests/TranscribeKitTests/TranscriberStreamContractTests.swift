@@ -61,6 +61,22 @@ final class StreamEvent: @unchecked Sendable {
             lock.unlock()
         }
     }
+
+    /// Bounded wait — returns `false` if the signal never came.
+    ///
+    /// An unbounded `wait()` in a test does not fail, it HANGS, and it takes
+    /// the whole suite with it: when the VAD hangover moved from 0.8 s to
+    /// 1.2 s, the 1 s of trailing silence below stopped closing windows, no
+    /// decode ever started, and `swift test` sat on this file forever with no
+    /// output. A test must be able to fail.
+    @discardableResult
+    func wait(within timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !isSignalled, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return isSignalled
+    }
 }
 
 /// A suspension that ends on `release()` OR on cancellation of the awaiting
@@ -352,7 +368,7 @@ final class TranscriberStreamTerminationTests: XCTestCase {
             Samples.speechChunk, seconds: 1.5, startingAt: 0, channel: .local, into: feeder
         )
         Samples.feed(
-            Samples.silenceChunk, seconds: 1.0, startingAt: afterSpeech, channel: .local, into: feeder
+            Samples.silenceChunk, seconds: 1.5, startingAt: afterSpeech, channel: .local, into: feeder
         )
     }
 
@@ -424,13 +440,13 @@ final class TranscriberStreamTerminationTests: XCTestCase {
                 Samples.speechChunk, seconds: 1.5, startingAt: 0, channel: .local, into: feeder
             )
             offset = Samples.feed(
-                Samples.silenceChunk, seconds: 1.0, startingAt: offset, channel: .local, into: feeder
+                Samples.silenceChunk, seconds: 1.5, startingAt: offset, channel: .local, into: feeder
             )
             offset = Samples.feed(
                 Samples.speechChunk, seconds: 1.5, startingAt: offset, channel: .local, into: feeder
             )
             Samples.feed(
-                Samples.silenceChunk, seconds: 1.0, startingAt: offset, channel: .local, into: feeder
+                Samples.silenceChunk, seconds: 1.5, startingAt: offset, channel: .local, into: feeder
             )
         }
 
@@ -480,10 +496,10 @@ final class TranscriberStreamTerminationTests: XCTestCase {
                 Samples.speechChunk, seconds: 1.5, startingAt: 0, channel: .local, into: feeder
             )
             Samples.feed(
-                Samples.silenceChunk, seconds: 1.0, startingAt: afterSpeech, channel: .local, into: feeder
+                Samples.silenceChunk, seconds: 1.5, startingAt: afterSpeech, channel: .local, into: feeder
             )
             Task {
-                await engine.entered.wait() // the decode is in flight
+                await engine.entered.wait(within: 5) // the decode is in flight
                 cancel.signal()
             }
         }
@@ -492,7 +508,9 @@ final class TranscriberStreamTerminationTests: XCTestCase {
         let released = await run.inputTermination()
         XCTAssertEqual(released, "cancelled",
                        "cancellation reaches through the in-flight decode")
-        await engine.left.wait() // the parked decode itself unwound, not just its caller
+        // The parked decode itself unwound, not just its caller.
+        let unwound = await engine.left.wait(within: 5)
+        XCTAssertTrue(unwound, "the in-flight decode never unwound")
     }
 
     // SPEC §4.2 serialises both channels onto one model. A stream cancelled
@@ -513,9 +531,10 @@ final class TranscriberStreamTerminationTests: XCTestCase {
             Samples.speechChunk, seconds: 1.5, startingAt: 0, channel: .local, into: holderFeeder
         )
         Samples.feed(
-            Samples.silenceChunk, seconds: 1.0, startingAt: afterSpeech, channel: .local, into: holderFeeder
+            Samples.silenceChunk, seconds: 1.5, startingAt: afterSpeech, channel: .local, into: holderFeeder
         )
-        await engine.entered.wait()
+        let holderDecoding = await engine.entered.wait(within: 5)
+        XCTAssertTrue(holderDecoding, "channel one never reached a decode — nothing to queue behind")
 
         // Channel two queues behind it, then the permit is released.
         let release = StreamEvent()
@@ -528,7 +547,7 @@ final class TranscriberStreamTerminationTests: XCTestCase {
                 Samples.speechChunk, seconds: 1.5, startingAt: 0, channel: .remote, into: feeder
             )
             Samples.feed(
-                Samples.silenceChunk, seconds: 1.0, startingAt: afterSpeech, channel: .remote, into: feeder
+                Samples.silenceChunk, seconds: 1.5, startingAt: afterSpeech, channel: .remote, into: feeder
             )
             release.signal()
         }
@@ -548,7 +567,7 @@ final class LazyResolutionBranchTerminationTests: XCTestCase {
             Samples.speechChunk, seconds: 1.5, startingAt: 0, channel: .local, into: feeder
         )
         Samples.feed(
-            Samples.silenceChunk, seconds: 1.0, startingAt: afterSpeech, channel: .local, into: feeder
+            Samples.silenceChunk, seconds: 1.5, startingAt: afterSpeech, channel: .local, into: feeder
         )
     }
 

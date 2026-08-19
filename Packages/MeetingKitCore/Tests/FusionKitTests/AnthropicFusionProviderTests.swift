@@ -80,11 +80,120 @@ final class AnthropicFusionProviderTests: XCTestCase {
         XCTAssertNil(body["temperature"], "current models reject `temperature` with a 400")
         XCTAssertEqual(body["model"] as? String, "claude-sonnet-5")
         XCTAssertEqual(body["max_tokens"] as? Int, AnthropicFusionProvider.maxTokens)
-        XCTAssertEqual(body["system"] as? String, "sys")
+        let system = try XCTUnwrap(body["system"] as? [[String: Any]])
+        XCTAssertEqual(system.count, 1)
+        XCTAssertEqual(system[0]["type"] as? String, "text")
+        XCTAssertEqual(system[0]["text"] as? String, "sys")
         let messages = try XCTUnwrap(body["messages"] as? [[String: Any]])
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(messages[0]["role"] as? String, "user")
-        XCTAssertEqual(messages[0]["content"] as? String, "user")
+        let content = try XCTUnwrap(messages[0]["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1)
+        XCTAssertEqual(content[0]["type"] as? String, "text")
+        XCTAssertEqual(content[0]["text"] as? String, "user")
+    }
+
+    // MARK: Prompt caching (item 22)
+
+    /// Both breakpoints sit on prefixes that are byte-stable across requests:
+    /// the frozen system prompt (stable across every session) and the
+    /// transcript block (stable across Retry and across a second pass).
+    /// A marker anywhere after per-request content would pay the write
+    /// premium for nothing.
+    func testSystemAndTranscriptBlocksCarryCacheBreakpoints() async throws {
+        let provider = makeProvider(status: 200, body: #"{"content":[{"type":"text","text":"Title: x"}]}"#)
+        _ = try await provider.complete(systemPrompt: SystemPrompt.v1, userPrompt: "[00:00] Me: hi", temperature: 0.2)
+
+        let body = try sentBody()
+        let system = try XCTUnwrap(body["system"] as? [[String: Any]])
+        XCTAssertEqual(
+            system[0]["cache_control"] as? [String: String], ["type": "ephemeral"],
+            "the static system prompt is the one prefix shared by every session"
+        )
+        let messages = try XCTUnwrap(body["messages"] as? [[String: Any]])
+        let content = try XCTUnwrap(messages[0]["content"] as? [[String: Any]])
+        XCTAssertEqual(
+            content[0]["cache_control"] as? [String: String], ["type": "ephemeral"],
+            "the transcript block is stable for the whole of one session's fusion work"
+        )
+        // Breakpoint budget is 4; two is deliberate, not an oversight.
+        let markers = system.filter { $0["cache_control"] != nil }.count
+            + content.filter { $0["cache_control"] != nil }.count
+        XCTAssertEqual(markers, 2)
+    }
+
+    /// A user message that is unique to one request — the long-meeting
+    /// COMPOSE call, which carries the chunk notes this run just produced —
+    /// must NOT be marked: nothing will ever read that entry back, so the
+    /// marker would be pure cache-write premium.
+    func testNonReusableUserMessageIsNotMarked() async throws {
+        let provider = makeProvider(status: 200, body: #"{"content":[{"type":"text","text":"Title: x"}]}"#)
+        _ = try await provider.complete(
+            systemPrompt: SystemPrompt.v1,
+            userPrompt: "--- Notes for part 1 of 2 ---\n…",
+            temperature: 0.2,
+            userPromptIsReusablePrefix: false
+        )
+        let body = try sentBody()
+        let messages = try XCTUnwrap(body["messages"] as? [[String: Any]])
+        let content = try XCTUnwrap(messages[0]["content"] as? [[String: Any]])
+        XCTAssertNil(content[0]["cache_control"], "per-request content is not a cacheable prefix")
+        // The frozen system prompt is still worth a breakpoint.
+        let system = try XCTUnwrap(body["system"] as? [[String: Any]])
+        XCTAssertNotNil(system[0]["cache_control"])
+    }
+
+    /// The system prompt is a `static let` with nothing interpolated — no
+    /// date, no session id. If that ever stops being true the cache prefix
+    /// changes on every request and both breakpoints stop reading.
+    func testSystemPromptBytesAreStableAcrossRequests() async throws {
+        let provider = makeProvider(status: 200, body: #"{"content":[{"type":"text","text":"Title: x"}]}"#)
+        _ = try await provider.complete(systemPrompt: SystemPrompt.v1, userPrompt: "a", temperature: 0.2)
+        let first = try XCTUnwrap((try sentBody()["system"] as? [[String: Any]])?[0]["text"] as? String)
+        _ = try await provider.complete(systemPrompt: SystemPrompt.v1, userPrompt: "b", temperature: 0.2)
+        let second = try XCTUnwrap((try sentBody()["system"] as? [[String: Any]])?[0]["text"] as? String)
+        XCTAssertEqual(first, second)
+    }
+
+    // MARK: Output cap + truncation (item 23)
+
+    /// Output is bounded and structured; an unbounded cap only risks runaway
+    /// cost. The value is the largest realistic note plus headroom.
+    func testOutputCapIsBounded() {
+        XCTAssertEqual(AnthropicFusionProvider.maxTokens, 1536)
+        XCTAssertLessThan(AnthropicFusionProvider.maxTokens, 4096, "the old unbounded-ish cap")
+    }
+
+    /// A note cut off at the cap still *looks* complete — title, summary, and
+    /// a Decisions section that simply stops. It must never reach the store.
+    func testTruncatedResponseIsAnErrorNotANote() async {
+        let truncated = makeProvider(
+            status: 200,
+            body: #"{"content":[{"type":"text","text":"Title: x\n\n## Summary\nHalf a summ"}],"stop_reason":"max_tokens"}"#
+        )
+        do {
+            _ = try await truncated.complete(systemPrompt: "s", userPrompt: "u", temperature: 0.2)
+            XCTFail("a truncated response must not be returned as a valid note")
+        } catch let error as AnthropicFusionProviderError {
+            guard case .responseTruncated(1536) = error else {
+                return XCTFail("expected .responseTruncated, got \(error)")
+            }
+            let message = FusionService.describe(error)
+            XCTAssertTrue(message.contains("cut off"), "the Retry UI must say why: \(message)")
+            XCTAssertTrue(message.contains("Nothing was saved"))
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+    }
+
+    /// …and a normal completion is unaffected by the check.
+    func testEndTurnResponseIsNotTreatedAsTruncated() async throws {
+        let provider = makeProvider(
+            status: 200,
+            body: #"{"content":[{"type":"text","text":"Title: x"}],"stop_reason":"end_turn"}"#
+        )
+        let text = try await provider.complete(systemPrompt: "s", userPrompt: "u", temperature: 0.2)
+        XCTAssertEqual(text, "Title: x")
     }
 
     /// The `FusionProvider` seam still carries the temperature for providers

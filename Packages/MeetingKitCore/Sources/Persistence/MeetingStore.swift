@@ -29,13 +29,36 @@ extension MeetingStoreError: LocalizedError {
     }
 }
 
-public final class MeetingStore: Sendable {
+public final class MeetingStore: @unchecked Sendable {
     private let dbQueue: DatabaseQueue
+
+    /// Segment writes are coalesced into one transaction per batch, bounded
+    /// by count AND time (item 25; SPEC §4.4 ≤ 5 s). See `SegmentBatcher`.
+    /// `@unchecked Sendable` because of the batcher's internal buffer — it
+    /// does its own locking; `DatabaseQueue` is already thread-safe.
+    private let segmentBatcher: SegmentBatcher
 
     // MARK: Lifecycle
 
-    public init(path: String) throws {
+    public convenience init(path: String) throws {
+        try self.init(path: path, segmentBatch: .default)
+    }
+
+    /// - Parameter segmentBatch: write-coalescing policy for segments. Tests
+    ///   that need a different bound (or none — `.immediate`) pass it here;
+    ///   the app always takes the default.
+    public init(path: String, segmentBatch: SegmentBatchPolicy) throws {
         dbQueue = try DatabaseQueue(path: path)
+        let queue = dbQueue
+        segmentBatcher = SegmentBatcher(policy: segmentBatch) { batch in
+            // ONE transaction for the whole batch — the point of item 25.
+            // `save` keeps the SPEC §4.2 upsert rule per row.
+            try queue.write { db in
+                for record in batch {
+                    try record.save(db)
+                }
+            }
+        }
         try Migrations.migrator.migrate(dbQueue)
         // A store from the FUTURE is not a store this build can use.
         //
@@ -60,6 +83,13 @@ public final class MeetingStore: Sendable {
     public static func inMemory() throws -> MeetingStore {
         let store = try MeetingStore(path: ":memory:")
         return store
+    }
+
+    /// Last chance for buffered segments: a store going away takes its
+    /// unwritten batch with it otherwise. (`deinit` cannot throw; the failure
+    /// path inside the batcher has already logged.)
+    deinit {
+        try? segmentBatcher.flush()
     }
 
     /// Default on-disk location: ~/Library/Application Support/Scribe/store.sqlite
@@ -161,6 +191,9 @@ public final class MeetingStore: Sendable {
     }
 
     public func deleteSession(id: UUID) throws {
+        // Flush FIRST: a buffered segment committed after the cascade would
+        // resurrect a row for a session that no longer exists.
+        try flushSegments()
         _ = try dbQueue.write { db in
             try SessionRecord.filter(Column("id") == id).deleteAll(db)
             try SegmentRecord.filter(Column("sessionId") == id).deleteAll(db)
@@ -173,14 +206,45 @@ public final class MeetingStore: Sendable {
 
     /// Upsert on segment id — the hard rule (SPEC §4.2). A revised hypothesis
     /// with the same UUID replaces the row; recovery stays duplicate-free.
+    ///
+    /// BATCHED (item 25): the row is buffered and committed with the rest of
+    /// its batch — after `SegmentBatchPolicy.maxCount` rows or
+    /// `maxDelay` seconds, whichever comes first, and always within the
+    /// SPEC §4.4 5 s bound. A revision for an id already in the batch
+    /// replaces it in the buffer, so the upsert rule holds before the write
+    /// as well as at it. `flushSegments()` forces the batch out; reads below
+    /// flush first, so nothing can observe a stale transcript through this
+    /// store.
+    ///
+    /// Throws either this call's own commit error or one from a batch that
+    /// was committed by the timer with no caller to tell (never silent).
     public func upsertSegment(_ segment: SegmentRecord) throws {
-        try dbQueue.write { db in
-            try segment.save(db)
-        }
+        try segmentBatcher.enqueue(segment)
+    }
+
+    /// Commits any buffered segments now. Called before every segment read,
+    /// at `deinit`, and available to callers that need disk state to be
+    /// current (stop → fusion, export, a kill-test).
+    public func flushSegments() throws {
+        try segmentBatcher.flush()
+    }
+
+    /// True when no segment write is waiting to be committed.
+    public var hasPendingSegmentWrites: Bool { !segmentBatcher.isEmpty }
+
+    /// Read-side flush: best effort ON PURPOSE. A read must show the newest
+    /// transcript, but it must not FAIL because a write failed — History
+    /// showing an empty meeting is worse than History showing what actually
+    /// reached disk. A failed batch is logged, stays queued, and is still
+    /// re-thrown to the next `upsertSegment`/`flushSegments` caller, so the
+    /// failure is surfaced to a writer rather than swallowed.
+    private func flushSegmentsBeforeRead() {
+        try? segmentBatcher.flush()
     }
 
     public func segments(sessionId: UUID) throws -> [SegmentRecord] {
-        try dbQueue.read { db in
+        flushSegmentsBeforeRead()
+        return try dbQueue.read { db in
             try SegmentRecord
                 .filter(Column("sessionId") == sessionId)
                 .order(Column("startOffset").asc, Column("id").asc)
@@ -189,7 +253,8 @@ public final class MeetingStore: Sendable {
     }
 
     public func segmentCount(sessionId: UUID) throws -> Int {
-        try dbQueue.read { db in
+        flushSegmentsBeforeRead()
+        return try dbQueue.read { db in
             try SegmentRecord.filter(Column("sessionId") == sessionId).fetchCount(db)
         }
     }

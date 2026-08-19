@@ -129,7 +129,7 @@ func waitUntil(
 
 final class WhisperKitTranscriberWindowingTests: XCTestCase {
 
-    /// 0.3 s silence → 2 s speech → 1 s (≥800 ms) silence emits EXACTLY one
+    /// 0.3 s silence → 2 s speech → 1.5 s (≥ the 1.2 s hangover) silence emits EXACTLY one
     /// segment whose text/offsets round-trip (SPEC §4.2 windowing rule).
     /// The trailing-silence amount also proves hangover closure happened
     /// BEFORE stream end: finish() would otherwise emit the window itself.
@@ -148,7 +148,7 @@ final class WhisperKitTranscriberWindowingTests: XCTestCase {
         var offset = 0.0
         offset = Samples.feed(Samples.silenceChunk, seconds: 0.3, startingAt: offset, channel: .local, into: continuation)
         offset = Samples.feed(Samples.speechChunk, seconds: 2.0, startingAt: offset, channel: .local, into: continuation)
-        offset = Samples.feed(Samples.silenceChunk, seconds: 1.0, startingAt: offset, channel: .local, into: continuation)
+        offset = Samples.feed(Samples.silenceChunk, seconds: 1.5, startingAt: offset, channel: .local, into: continuation)
 
         await waitUntil(collector.count == 1)
         continuation.finish()
@@ -194,9 +194,9 @@ final class WhisperKitTranscriberWindowingTests: XCTestCase {
 
         var offset = 0.0
         offset = Samples.feed(Samples.speechChunk, seconds: 1.5, startingAt: offset, channel: .local, into: continuation)
-        offset = Samples.feed(Samples.silenceChunk, seconds: 1.0, startingAt: offset, channel: .local, into: continuation)
+        offset = Samples.feed(Samples.silenceChunk, seconds: 1.5, startingAt: offset, channel: .local, into: continuation)
         offset = Samples.feed(Samples.speechChunk, seconds: 1.5, startingAt: offset, channel: .local, into: continuation)
-        Samples.feed(Samples.silenceChunk, seconds: 1.0, startingAt: offset, channel: .local, into: continuation)
+        Samples.feed(Samples.silenceChunk, seconds: 1.5, startingAt: offset, channel: .local, into: continuation)
 
         await waitUntil(collector.count == 2)
         continuation.finish()
@@ -205,10 +205,10 @@ final class WhisperKitTranscriberWindowingTests: XCTestCase {
         let segments = collector.snapshot
         XCTAssertEqual(segments.count, 2)
         XCTAssertTrue(segments[0].id != segments[1].id, "different windows mint different ids")
-        XCTAssertEqual(segments[1].startOffset, 2.5, accuracy: 0.05, "second burst starts at 1.5 + 1.0 of silence")
+        XCTAssertEqual(segments[1].startOffset, 3.0, accuracy: 0.05, "second burst starts at 1.5 + 1.5 of silence")
     }
 
-    /// Speech shorter than the 1 s minimum is dropped (not worth a decode).
+    /// Speech shorter than the 0.4 s minimum is dropped (not worth a decode).
     func testSubMinimumBurstIsDropped() async {
         let engine = FakeEngine()
         engine.respond = { _ in
@@ -219,8 +219,8 @@ final class WhisperKitTranscriberWindowingTests: XCTestCase {
         let (continuation, collector, task) = makePipeline(transcriber)
 
         var offset = 0.0
-        offset = Samples.feed(Samples.speechChunk, seconds: 0.4, startingAt: offset, channel: .local, into: continuation)
-        Samples.feed(Samples.silenceChunk, seconds: 1.0, startingAt: offset, channel: .local, into: continuation)
+        offset = Samples.feed(Samples.speechChunk, seconds: 0.2, startingAt: offset, channel: .local, into: continuation)
+        Samples.feed(Samples.silenceChunk, seconds: 1.5, startingAt: offset, channel: .local, into: continuation)
         continuation.finish()
         await task.value
 
@@ -309,7 +309,7 @@ final class SegmentIdStabilityTests: XCTestCase {
 
         var offset = 0.0
         for _ in 0..<30 { await worker.feed(Samples.speechChunk(channel: .local, offset: offset)); offset += 0.1 }
-        for _ in 0..<10 { await worker.feed(Samples.silenceChunk(channel: .local, offset: offset)); offset += 0.1 }
+        for _ in 0..<15 { await worker.feed(Samples.silenceChunk(channel: .local, offset: offset)); offset += 0.1 }
         await waitUntil(collector.count == 1)
 
         // "Revision": a Phase 2 re-decode of the same window replays through
@@ -443,13 +443,27 @@ final class ModelDownloadManagerTests: XCTestCase {
             .appending(path: "scribe-mdm-\(UUID().uuidString)")
         let variant = root
             .appending(path: "models--argmaxinc--whisperkit-coreml/snapshots/abc/openai_whisper-small.en")
+        let bundle = variant.appending(path: "melSpectrogram.mlmodelc")
         try FileManager.default.createDirectory(
-            at: variant.appending(path: "melSpectrogram.mlmodelc"),
+            at: bundle.appending(path: "weights"),
             withIntermediateDirectories: true
         )
         defer { try? FileManager.default.removeItem(at: root) }
 
         let manager = ModelDownloadManager(modelRoot: root)
+
+        // An interrupted download leaves the directory tree and the small
+        // metadata files but no weights, and that state used to report
+        // "Downloaded" — a real 889 MB model stalled at 9.7 MB, said it was
+        // ready, then failed to load at session start and produced an empty
+        // transcript with no error. Presence therefore requires real weights.
+        XCTAssertFalse(
+            manager.isDownloaded("small.en"),
+            "a bundle with an empty weights/ directory is a half-finished download"
+        )
+
+        try Data(repeating: 0, count: 2_000_000)
+            .write(to: bundle.appending(path: "weights/weight.bin"))
         XCTAssertTrue(manager.isDownloaded("small.en"))
         XCTAssertFalse(manager.isDownloaded("large-v3-turbo"))
     }
