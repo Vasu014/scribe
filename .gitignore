@@ -5,3 +5,7 @@ DerivedData/
 xcuserdata/
 *.xcuserdatad/
 /Scribe.xcodeproj
+
+# Release artifacts (a DMG and a 1.5 GB DerivedData tree — never committed).
+build/
+dist/

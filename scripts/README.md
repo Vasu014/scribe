@@ -48,17 +48,43 @@ and lists what's needed; `--dry-run` prints the full plan with placeholders.
 | Variable | Required | Purpose |
 |---|---|---|
 | `SCRIBE_TEAM_ID` | ✅ | Apple Developer Team ID → `DEVELOPMENT_TEAM` |
-| `SCRIBE_SIGNING_IDENTITY` | ✅ | `Developer ID Application: NAME (TEAMID)` → `CODE_SIGN_IDENTITY` |
+| `SCRIBE_SIGNING_IDENTITY` | ✅ | `Developer ID Application: NAME (TEAMID)` → `codesign --sign` |
 | `SCRIBE_NOTARY_PROFILE` | ✅ | App Store Connect API or keychain profile name for `xcrun notarytool` |
 | `SCRIBE_FEED_URL` | ✅ | Sparkle appcast URL, baked into `SUFeedURL` (Info.plist) at build time |
 | `SCRIBE_PUBLIC_ED_KEY` | — | Sparkle Ed25519 public key → `SUPublicEDKey` (signing week) |
 | `SCRIBE_BUILD_NUMBER` | — | `CFBundleVersion`; defaults to the git commit count |
 | `SCRIBE_OUT_DIR` | — | Output directory; defaults to `dist/` |
 
-Pipeline: xcodegen → Release build (signed, feed URL baked in) →
-`codesign --verify` → notarize + staple `.app` → `hdiutil` UDZO DMG → sign →
-notarize + staple DMG. The DMG is deliberately plain UDZO (no fancy
+Pipeline: xcodegen → Release build (**unsigned**, feed URL baked in) → sign
+innermost-first → `codesign --verify --deep --strict` + entitlement audit →
+notarize + staple `.app` → `spctl --assess` → `hdiutil` UDZO DMG → sign →
+notarize + staple + validate DMG. The DMG is deliberately plain UDZO (no fancy
 background/layout) — AJDBZJ/`create-dmg` polish is out of scope for v0.
+
+Three things about that pipeline are load-bearing and easy to undo:
+
+- **Signing order is innermost-first.** Sparkle ships `Autoupdate`,
+  `Updater.app` and the two XPC services pre-signed by the Sparkle project
+  (ad-hoc, no team, no timestamp), and SPM does not re-sign nested bundles
+  inside a binary framework. `release.sh` signs `Installer.xpc` →
+  `Downloader.xpc` → `Updater.app` → `Autoupdate` → `Sparkle.framework` →
+  `Scribe.app`, per [Sparkle's own
+  docs](https://sparkle-project.org/documentation/sandboxing/). Signing a
+  container seals what is inside it, so signing outside-in silently
+  invalidates the inner signatures and notarization fails with "not signed
+  with a valid Developer ID certificate".
+- **`--timestamp` on every `codesign`.** Notarization rejects any signature
+  without a secure timestamp, including the DMG's. It needs network access.
+- **`CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO` on the release build.** Xcode
+  otherwise merges `com.apple.security.get-task-allow` (the debug entitlement)
+  into `App/Scribe.entitlements`, which Apple rejects for distribution. It is
+  passed on the `xcodebuild` command line only, so Debug builds, `make build`
+  and CI keep the injected entitlement they want.
+
+Every step is a gate. `notarytool submit --wait` **exits 0 even when the
+submission comes back `Invalid`**, so `release.sh` parses the JSON `status`
+and fails hard on anything but `Accepted`, printing the submission id and the
+`xcrun notarytool log …` command to run. Staple and `spctl` failures abort too.
 
 ## One-time signing-week setup (human steps)
 
