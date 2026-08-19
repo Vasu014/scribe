@@ -240,7 +240,7 @@ private actor InferenceGate {
 /// purpose: see `LazyWhisperKitTranscriber`'s class docs.
 private actor Resolver {
 
-    private static let logger = Logger(subsystem: "com.example.scribe", category: "transcriber")
+    private static let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber")
 
     // Model cache — one engine per app lifetime, keyed by variant.
     private var engineVariant: String?

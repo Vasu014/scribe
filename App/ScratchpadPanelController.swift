@@ -345,7 +345,7 @@ final class ScratchpadPanelController: NSObject {
     /// start / state change.
     private var startFailureMessage: String?
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "scratchpad")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "scratchpad")
     private let coordinator: SessionCoordinator
     private let composer: FragmentComposer
 

@@ -51,7 +51,7 @@ final class HistoryWindowController: NSObject {
     /// Selection persistence (last selected session id) — cheap convenience.
     private static let selectedSessionDefaultsKey = "history.selectedSessionId"
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "history")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "history")
     private let store: MeetingStore
     private let coordinator: SessionCoordinator
 

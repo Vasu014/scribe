@@ -108,7 +108,7 @@ A setup wizard walks you through, and resumes where it left off if interrupted:
 4. **API key** — optional at setup; without it meetings still record and
    transcribe, they just cannot be fused into notes.
 
-Re-run it any time with `defaults write com.example.Scribe setupPhase -int 0`.
+Re-run it any time with `defaults write io.github.vasu014.scribe setupPhase -int 0`.
 
 ---
 

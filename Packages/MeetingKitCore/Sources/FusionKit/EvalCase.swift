@@ -199,7 +199,7 @@ public struct EvalCase: Codable, Equatable, Sendable {
 
     // MARK: Machine id
 
-    private static let machineIdDefaultsKey = "com.example.scribe.machine-id"
+    private static let machineIdDefaultsKey = "io.github.vasu014.scribe.machine-id"
 
     /// Stable per-install id: a UUID generated once and persisted to
     /// UserDefaults (SPEC §4.5 `machine_id`). `defaults` is injectable so

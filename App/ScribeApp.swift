@@ -18,7 +18,7 @@ import os
 @main
 final class ScribeApp: NSObject, NSApplicationDelegate {
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "app")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "app")
 
     private var coordinator: SessionCoordinator!
     private var composer: FragmentComposer!
@@ -51,7 +51,7 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
 
     /// Cross-process summon (see the single-instance guard). Named off the
     /// bundle id so two different apps never collide on it.
-    private static let summonNotification = Notification.Name("com.example.Scribe.summonScratchpad")
+    private static let summonNotification = Notification.Name("io.github.vasu014.scribe.summonScratchpad")
 
     /// Another live instance of this app, if any. Matches on BUNDLE ID, not
     /// path: the whole point is catching a DerivedData build and an
@@ -1139,7 +1139,7 @@ final class SessionWarningBanner {
         override var canBecomeMain: Bool { false }
     }
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "warning")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "warning")
     private let panel: BannerPanel
     private let effect = NSVisualEffectView()
     private let stack = NSStackView()

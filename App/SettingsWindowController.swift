@@ -127,7 +127,7 @@ final class SettingsWindowController: NSObject {
     /// this is a lookup, never an owner.
     private(set) static weak var current: SettingsWindowController?
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "settings")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "settings")
     private let keychain = KeychainStore()
     private let window: NSWindow
 

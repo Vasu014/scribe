@@ -30,7 +30,7 @@ final class MenuBarController: NSObject {
     /// Processing spinner side (design 1a: 13 × 13 pt).
     private static let spinnerSide: CGFloat = 13
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "menubar")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "menubar")
     private let coordinator: SessionCoordinator
 
     /// Open Settings… ⌘, — set by ScribeApp.

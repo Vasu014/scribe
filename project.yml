@@ -1,6 +1,6 @@
 name: Scribe
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: io.github.vasu014
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -8,6 +8,12 @@ settings:
   base:
     SWIFT_VERSION: "5.10"
     ARCHS: [arm64]
+    # Set explicitly, NOT derived from bundleIdPrefix + target name: that
+    # would yield `io.github.vasu014.Scribe` (capital S from the target).
+    # This string is the app's identity to macOS — TCC grants, the Keychain
+    # service, the defaults domain and Sparkle update matching all key off
+    # it, so it must not drift (SPEC §6).
+    PRODUCT_BUNDLE_IDENTIFIER: io.github.vasu014.scribe
     # SPEC §6: hardened runtime (Developer ID notarization requires it).
     ENABLE_HARDENED_RUNTIME: YES
     SUPPORTS_MACCATALYST: NO

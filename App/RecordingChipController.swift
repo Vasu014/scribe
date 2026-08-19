@@ -284,7 +284,7 @@ final class RecordingChipController: NSObject {
 
     private static let pulseKey = "scribe.chip.pulse"
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "chip")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "chip")
     private let coordinator: SessionCoordinator
 
     /// Click on the chip body → show the scratchpad (owner-approved deviation

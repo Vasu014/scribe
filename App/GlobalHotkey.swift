@@ -37,7 +37,7 @@ final class GlobalHotkey: @unchecked Sendable {
     private static let signature: OSType = 0x53_43_52_42
 
     private let kind: Kind
-    private let logger = Logger(subsystem: "com.example.scribe", category: "hotkey")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "hotkey")
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
 

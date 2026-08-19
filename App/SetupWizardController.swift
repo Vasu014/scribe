@@ -89,7 +89,7 @@ final class SetupWizardController: NSObject {
     private static let cardBodyWidth: CGFloat = 372 // 400 − 2×14 card insets
     private static let minHeight: CGFloat = 340
 
-    private let logger = Logger(subsystem: "com.example.scribe", category: "setup")
+    private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "setup")
     private let keychain = KeychainStore()
     private let downloads = ModelDownloadManager()
 

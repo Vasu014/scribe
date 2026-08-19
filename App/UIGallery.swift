@@ -48,7 +48,7 @@ enum UIGallery {
     /// kills it.
     private static var retained: [Any] = []
 
-    private static let logger = Logger(subsystem: "com.example.scribe", category: "uigallery")
+    private static let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "uigallery")
 
     // MARK: - Entry point
 

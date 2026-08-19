@@ -20,13 +20,13 @@ public enum KeychainStoreError: Error, Equatable, Sendable {
 /// Uses `kSecUseDataProtectionKeychain` so the item behaves correctly with
 /// the app's (future) entitlements on modern macOS.
 ///
-/// Service name uses the PLACEHOLDER bundle id `com.example.scribe` (SPEC
-/// §3.1) — must be finalized before signing week, together with the real
-/// bundle id.
+/// Service name is the app's bundle id, `io.github.vasu014.scribe` (SPEC §3.1,
+/// finalized 2026-08-19). Changing it strands every saved key: Keychain items
+/// are looked up by service, so a renamed service reads as "no key saved".
 public final class KeychainStore: Sendable {
 
-    /// Placeholder bundle id (SPEC §3.1) — update when the bundle id is finalized.
-    public static let defaultService = "com.example.scribe"
+    /// The app's bundle id (SPEC §3.1). Must match `PRODUCT_BUNDLE_IDENTIFIER`.
+    public static let defaultService = "io.github.vasu014.scribe"
     /// Keychain account for the Anthropic API key item.
     public static let anthropicAPIKeyAccount = "anthropic-api-key"
 
