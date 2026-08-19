@@ -10,24 +10,44 @@ import os
 /// The Carbon callback may fire on any thread; it hops to the main queue
 /// before invoking `onSummon`. Create and release on the main thread (Carbon
 /// event-target installation is main-thread-only); unregistration happens in
-/// `deinit`.
+/// `deinit`, so an instance's lifetime IS the registration's lifetime.
+///
+/// EVERY registration here is a system-wide grab: the key stops reaching the
+/// front app for as long as the instance lives. That is the point for ⌥⌘N (a
+/// modified chord no other app owns), and it is why the panel's Esc-to-dismiss
+/// is NOT implemented here — see `ScratchpadPanelController.dismiss()`. Only
+/// register modified chords, and only for the app's lifetime.
 final class GlobalHotkey: @unchecked Sendable {
 
-    /// Summon/dismiss the scratchpad panel. Set by the app; the panel itself
-    /// lands in T6 — until then a press logs a no-op instead of crashing the
-    /// closure contract.
+    /// Which shortcut an instance owns. Each kind carries its own Carbon
+    /// hotkey id: every installed handler on the application event target
+    /// sees EVERY hotkey press, so the id is what keeps two live instances
+    /// from firing each other's closures.
+    enum Kind: UInt32 {
+        /// ⌥⌘N — summon/dismiss the scratchpad (SPEC §5). App-lifetime.
+        case summon = 1
+    }
+
+    /// Fired on the main queue when the shortcut is pressed. Set by the app;
+    /// a press with no handler logs a no-op instead of crashing the closure
+    /// contract.
     var onSummon: (() -> Void)?
 
     /// 'SCRB' — distinguishes our hotkey IDs from any other installer's.
     private static let signature: OSType = 0x53_43_52_42
-    private static let summonID: UInt32 = 1
 
+    private let kind: Kind
     private let logger = Logger(subsystem: "com.example.scribe", category: "hotkey")
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
 
     /// Registers ⌥⌘N by default (SPEC §5 default hotkey; user-remappable later).
-    init(keyCode: UInt32 = UInt32(kVK_ANSI_N), modifiers: UInt32 = UInt32(cmdKey | optionKey)) {
+    init(
+        keyCode: UInt32 = UInt32(kVK_ANSI_N),
+        modifiers: UInt32 = UInt32(cmdKey | optionKey),
+        kind: Kind = .summon
+    ) {
+        self.kind = kind
         var spec = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
@@ -48,13 +68,20 @@ final class GlobalHotkey: @unchecked Sendable {
         let registerStatus = RegisterEventHotKey(
             keyCode,
             modifiers,
-            EventHotKeyID(signature: Self.signature, id: Self.summonID),
+            EventHotKeyID(signature: Self.signature, id: kind.rawValue),
             GetApplicationEventTarget(),
             0,
             &hotKeyRef
         )
+        logger.info("""
+        Registered global hotkey \(String(describing: kind), privacy: .public) — keyCode \(keyCode), \
+        modifiers \(modifiers). That combination is consumed system-wide for this instance's lifetime.
+        """)
         if installStatus != noErr || registerStatus != noErr {
-            logger.error("Hotkey registration failed (install \(installStatus), register \(registerStatus)) — ⌥⌘N will not work this launch.")
+            logger.error("""
+            Hotkey registration failed for \(String(describing: kind), privacy: .public) \
+            (install \(installStatus), register \(registerStatus)) — that shortcut will not work.
+            """)
         }
     }
 
@@ -82,8 +109,11 @@ final class GlobalHotkey: @unchecked Sendable {
             nil,
             &id
         )
-        guard status == noErr, id.signature == signature, id.id == summonID else { return noErr }
+        guard status == noErr, id.signature == signature else { return noErr }
         let hotkey = Unmanaged<GlobalHotkey>.fromOpaque(userData).takeUnretainedValue()
+        // Every installed handler receives every hotkey press; only the
+        // instance that registered THIS id may act on it.
+        guard id.id == hotkey.kind.rawValue else { return noErr }
         DispatchQueue.main.async {
             hotkey.fire()
         }
@@ -95,9 +125,7 @@ final class GlobalHotkey: @unchecked Sendable {
         if let onSummon {
             onSummon()
         } else {
-            // TODO(T6): ScribeApp sets `onSummon` to the scratchpad panel
-            // toggle. Logged as a no-op until then.
-            logger.debug("⌥⌘N pressed but no summon handler is registered (scratchpad panel lands in T6).")
+            logger.debug("\(String(describing: self.kind), privacy: .public) hotkey pressed with no handler registered — ignored.")
         }
     }
 }
