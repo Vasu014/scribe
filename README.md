@@ -8,7 +8,7 @@ It does not join your meetings as a bot, does not upload audio, and never
 writes audio to disk. The only thing that leaves your machine is the text sent
 to the Anthropic API at the end of a meeting, using your own API key.
 
-![The Scribe status item in its five states](docs/screenshots/menu-bar-states.png)
+<img src="docs/screenshots/menu-bar-states.png" alt="The Scribe status item in its five states" width="540">
 
 *The whole app lives in one menu bar item: idle, recording with the elapsed
 clock, fusing, notes ready, failed. The status-item artwork is the app's own,
@@ -40,7 +40,7 @@ While the meeting runs you can jot rough notes in a floating scratchpad
 (⌥⌘N). Each note is timestamped against the meeting clock, so fusion knows
 *when* you wrote it and can anchor it to what was being discussed.
 
-![The scratchpad panel floating over a fullscreen app while a meeting records](docs/screenshots/scratchpad.png)
+<img src="docs/screenshots/scratchpad.png" alt="The scratchpad panel floating over a fullscreen app while a meeting records" width="330">
 
 *The scratchpad while a meeting runs — plain text, no formatting, saved as you
 type. It floats above whatever you are doing and never takes focus from your
@@ -53,7 +53,7 @@ every citation against the real transcript and flags any quote it cannot find.
 That warning card is the hallucination-audit surface: fusion is not trusted, it
 is checked.
 
-![A fused note in the History window, with a validator warning card above the action items](docs/screenshots/history-notes.png)
+<img src="docs/screenshots/history-notes.png" alt="A fused note in the History window, with a validator warning card above the action items" width="660">
 
 *The result, in History. Every action item carries a timestamp and a verbatim
 quote — and the yellow card is the validator saying it could not find one of
@@ -134,7 +134,7 @@ it to jump to the scratchpad, drag it along the top edge to move it. The
 recording indicator is never absent while the mic is live — that is a
 deliberate consent guarantee, not a convenience.
 
-![The recording chip in the top-right corner of a fullscreen app, hovered, showing a Stop button](docs/screenshots/recording-chip.png)
+<img src="docs/screenshots/recording-chip.png" alt="The recording chip in the top-right corner of a fullscreen app, hovered, showing a Stop button" width="400">
 
 *The chip in a fullscreen space, where there is no menu bar to fall back on.
 Hovering it reveals Stop.*
@@ -157,7 +157,7 @@ and notes are already saved, so a retry costs nothing but the API call.
   transcript. Anchoring only; raw audio is never retained.
 - **Launch at Login**
 
-![The Scribe settings window](docs/screenshots/settings.png)
+<img src="docs/screenshots/settings.png" alt="The Scribe settings window" width="520">
 
 *Four settings and nothing else. The API key is shown masked once set — it is
 read from the Keychain, never stored in a plist.*
