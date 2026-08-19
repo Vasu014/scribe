@@ -6,6 +6,29 @@ import GRDB
 ///
 /// WAL mode (GRDB default for on-disk queues) is what makes the crash-recovery
 /// guarantee cheap: committed rows survive kill -9 without a clean close.
+/// Typed failures the store raises for itself, on top of GRDB's
+/// `DatabaseError`. Kept `LocalizedError` because the composition root puts
+/// `error.localizedDescription` straight into the blocking store-failure
+/// alert — the user must be told what is wrong, not shown an enum.
+public enum MeetingStoreError: Error, Equatable, Sendable {
+    /// The file was written by a NEWER build of Scribe: its
+    /// `meta.schema_version` is beyond what this build understands.
+    case schemaTooNew(found: Int, supported: Int)
+}
+
+extension MeetingStoreError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .schemaTooNew(let found, let supported):
+            return """
+            This meeting database was created by a newer version of Scribe \
+            (database format \(found); this version reads up to \(supported)). \
+            Update Scribe to open it — an older version could lose data written by the newer one.
+            """
+        }
+    }
+}
+
 public final class MeetingStore: Sendable {
     private let dbQueue: DatabaseQueue
 
@@ -14,6 +37,24 @@ public final class MeetingStore: Sendable {
     public init(path: String) throws {
         dbQueue = try DatabaseQueue(path: path)
         try Migrations.migrator.migrate(dbQueue)
+        // A store from the FUTURE is not a store this build can use.
+        //
+        // `DatabaseMigrator` skips migration identifiers it does not know, so
+        // a database written by a newer Scribe opens here without a murmur:
+        // History lists the meetings, recording works, and every write goes
+        // into a schema this build only half understands — new NOT NULL
+        // columns are missed, new tables are never maintained, and the newer
+        // build's own invariants are quietly broken by the older one. That is
+        // the same shape as the in-memory-store fallback the app removed:
+        // everything LOOKS fine and the damage is only visible later.
+        //
+        // `meta.schema_version` exists precisely so this can be checked
+        // (SPEC §4.6, "REQUIRED from day one") — until now nothing read it
+        // outside tests. Refuse, with a typed error the alert can explain.
+        let version = try schemaVersion
+        guard version <= Migrations.currentVersion else {
+            throw MeetingStoreError.schemaTooNew(found: version, supported: Migrations.currentVersion)
+        }
     }
 
     public static func inMemory() throws -> MeetingStore {

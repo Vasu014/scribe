@@ -262,9 +262,23 @@ public enum NotesValidator {
 
     /// `None recorded.` / `No decisions.` / `N/A` — an honest empty section,
     /// not an uncited claim. Exempt from check (c).
+    ///
+    /// The marker must be SHORT as well as start with a none-word. Matching
+    /// on the prefix alone exempted any item that happened to begin with one,
+    /// so a real, uncited Decision — "None of the proposed vendors met the
+    /// security bar, so we are staying with Acme." — read as an empty section
+    /// and the whole item went unchecked. That is the audit surface reporting
+    /// green on a claim nobody verified, which is the one failure mode this
+    /// validator exists to prevent. Every phrasing a model actually uses for
+    /// an empty section ("None recorded.", "No decisions were made.",
+    /// "No action items were recorded.", "Nothing to report.") fits inside
+    /// the cap; a sentence that goes on to assert something does not.
+    static let noneMarkerWordLimit = 6
+
     static func isNoneMarker(_ text: String) -> Bool {
         let n = CanonicalRendering.normalize(text)
         if n.isEmpty || n == "na" || n == "n a" { return true }
+        guard n.split(separator: " ").count <= noneMarkerWordLimit else { return false }
         for prefix in ["none", "nothing", "no decisions", "no action", "no actions", "no items"]
         where n.hasPrefix(prefix) {
             return true
@@ -372,7 +386,16 @@ public enum NotesValidator {
 
     /// Quoted spans, left to right, non-overlapping. Content is trimmed and
     /// must be ≥3 characters (matching the old regex's `{3,}` floor — one- or
-    /// two-character "quotes" are punctuation accidents, not citations).
+    /// two-character "quotes" are punctuation accidents, not citations) AND
+    /// must survive normalization with something left in it.
+    ///
+    /// That second rule is what stops a placeholder from counting as
+    /// evidence. `- [01:40] "..." — Ship on Friday.` used to produce a
+    /// citation whose normalized needle was empty; check (b) skipped it as
+    /// unmatchable and check (c) considered the item cited, so an item with
+    /// no quote at all passed the hallucination audit CLEAN. A quote made
+    /// only of punctuation is not a verbatim transcript quote — it is the
+    /// absence of one, and must be reported as `missingCitation`.
     static func quoteSpans(in chars: [Character]) -> [(range: Range<Int>, text: String)] {
         let doubleOpeners: Set<Character> = ["\"", "\u{201C}"]
         let doubleClosers: Set<Character> = ["\"", "\u{201D}"]
@@ -400,7 +423,7 @@ public enum NotesValidator {
                 continue
             }
             let inner = String(chars[(index + 1)..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if inner.count >= 3 {
+            if inner.count >= 3, !CanonicalRendering.normalize(inner).isEmpty {
                 result.append((index..<(end + 1), inner))
             }
             index = end + 1

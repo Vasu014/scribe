@@ -6,6 +6,12 @@ import GRDB
 /// After day 2 of the build, every schema change lands here as a new migration.
 public enum Migrations {
 
+    /// The highest `meta.schema_version` this build knows how to read.
+    ///
+    /// Bump it in the same migration that writes the new value, or the guard
+    /// in `MeetingStore.init` will reject the store the migration just wrote.
+    public static let currentVersion = 2
+
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
 
