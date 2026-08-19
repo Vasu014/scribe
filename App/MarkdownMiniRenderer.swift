@@ -7,6 +7,11 @@ import AppKit
 /// fused output (SPEC §4.5 output format) is dropped — the notes pane header
 /// already shows the session title.
 ///
+/// Blocks follow markdown's paragraph rule: consecutive non-blank source
+/// lines are ONE wrapped paragraph (soft line breaks are joined with a
+/// space); only a blank line, a heading, or a bullet starts a new block. A
+/// bullet's lazy continuation lines join that bullet.
+///
 /// Bullets under an `## Action items` heading render with a STATIC checkbox
 /// glyph (design 1d: square + border, non-interactive — v0 stores no
 /// action-item done-ness and this surface must not become a todo widget,
@@ -23,10 +28,17 @@ enum MarkdownMiniRenderer {
 
     // Type (design 1d; native system equivalents over the HTML hex values).
     private static let bodyFont = NSFont.systemFont(ofSize: 13)
-    private static let bodyColor = NSColor.labelColor // design #333
+    private static let bodyColor = NSColor.textColor // design #333
     /// Design 13 pt / CSS line-height 1.55 ≈ 1.25 AppKit multiple (same
     /// conversion as the scratchpad body).
     private static let lineHeightMultiple: CGFloat = 1.25
+    /// Action items are drawn tighter than body copy (design 1d: 1.45).
+    private static let bulletLineHeightMultiple: CGFloat = 1.17
+
+    /// Marks a rendered `##` section label ("SUMMARY", "ACTION ITEMS") so
+    /// callers can splice blocks into the notes flow between sections
+    /// (History's inline validator cards, design 1d).
+    static let sectionLabelAttribute = NSAttributedString.Key("scribe.markdown.sectionLabel")
 
     // MARK: - Entry
 
@@ -39,30 +51,95 @@ enum MarkdownMiniRenderer {
         var section = ""
         /// True once the fused output's leading `Title:` line was dropped.
         var droppedTitle = false
+        /// The block being accumulated; soft-wrapped source lines join it.
+        var pending: PendingBlock?
+        /// True while the next block directly follows a heading — the design's
+        /// section label already carries the 6 pt gap below it.
+        var afterHeading = false
 
-        for rawLine in markdown.split(separator: "\n", omittingEmptySubsequences: true) {
+        func flush() {
+            switch pending {
+            case .none:
+                return
+            case .body(let text):
+                appendBody(text, topMargin: (output.length == 0 || afterHeading) ? 0 : 8, to: output)
+            case .bullet(let text, let glyph):
+                appendBullet(text, checkbox: glyph, to: output)
+            }
+            pending = nil
+            afterHeading = false
+        }
+
+        for rawLine in markdown.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
 
-            if !droppedTitle, output.length == 0, line.lowercased().hasPrefix("title:") {
+            if line.isEmpty {
+                flush() // blank line = paragraph break
+                continue
+            }
+
+            if !droppedTitle, output.length == 0, pending == nil, line.lowercased().hasPrefix("title:") {
                 droppedTitle = true // the pane header shows the title (design 1d)
                 continue
             }
 
             if let (level, text) = heading(line) {
+                flush()
                 section = level == 2 ? text.lowercased() : ""
-                appendHeading(text, level: level, to: output)
+                appendHeading(text, level: level, isFirstBlock: output.length == 0, to: output)
+                afterHeading = true
                 continue
             }
 
             if let text = bulletText(line) {
-                let checkboxBullet = checkbox != nil && section.contains("action item")
-                appendBullet(text, checkbox: checkboxBullet ? checkbox : nil, to: output)
+                flush()
+                let wantsCheckbox = checkbox != nil && section.contains("action item")
+                pending = .bullet(text: text, checkbox: wantsCheckbox ? checkbox : nil)
                 continue
             }
 
-            appendBody(line, to: output)
+            switch pending {
+            case .body(let text):
+                pending = .body(text + " " + line)
+            case .bullet(let text, let glyph):
+                pending = .bullet(text: text + " " + line, checkbox: glyph) // lazy continuation
+            case .none:
+                pending = .body(line)
+            }
         }
+        flush()
         return output
+    }
+
+    /// Character index just past the first `##` section — i.e. the start of
+    /// the SECOND section label, or the end of the string when there is no
+    /// second section. History inserts its validator cards here so they sit
+    /// with the summary body they flag (design 1d "margin-top: 10px … sits
+    /// between summary body and next section label").
+    static func endOfFirstSection(in string: NSAttributedString) -> Int {
+        var seen = 0
+        var index = string.length
+        string.enumerateAttribute(
+            sectionLabelAttribute,
+            in: NSRange(location: 0, length: string.length),
+            options: []
+        ) { value, range, stop in
+            guard value != nil else { return }
+            seen += 1
+            if seen == 2 {
+                index = range.location
+                stop.pointee = true
+            }
+        }
+        return index
+    }
+
+    // MARK: - Block accumulation
+
+    /// The block currently being accumulated across soft-wrapped lines.
+    private enum PendingBlock {
+        case body(String)
+        case bullet(text: String, checkbox: NSImage?)
     }
 
     // MARK: - Line classification
@@ -91,9 +168,13 @@ enum MarkdownMiniRenderer {
 
     // MARK: - Blocks
 
-    private static func appendHeading(_ text: String, level: Int, to output: NSMutableAttributedString) {
+    private static func appendHeading(
+        _ text: String, level: Int, isFirstBlock: Bool, to output: NSMutableAttributedString
+    ) {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.paragraphSpacingBefore = level == 2 ? 14 : 10
+        // Design 1d: section label 2 `margin: 16px 0 6px`; the first label
+        // needs no top margin (the meta line already supplies it).
+        paragraph.paragraphSpacingBefore = isFirstBlock ? 0 : (level == 2 ? 16 : 10)
         paragraph.paragraphSpacing = 6
         var attributes: [NSAttributedString.Key: Any] = [.paragraphStyle: paragraph]
         switch level {
@@ -106,6 +187,7 @@ enum MarkdownMiniRenderer {
             attributes[.font] = NSFont.systemFont(ofSize: 12, weight: .semibold)
             attributes[.foregroundColor] = NSColor.secondaryLabelColor
             attributes[.kern] = 0.6
+            attributes[sectionLabelAttribute] = true
         default:
             attributes[.font] = NSFont.systemFont(ofSize: 13, weight: .semibold)
             attributes[.foregroundColor] = bodyColor
@@ -116,9 +198,8 @@ enum MarkdownMiniRenderer {
 
     private static func appendBullet(_ text: String, checkbox: NSImage?, to output: NSMutableAttributedString) {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.paragraphSpacingBefore = 3
-        paragraph.paragraphSpacing = 3
-        paragraph.lineHeightMultiple = lineHeightMultiple
+        paragraph.paragraphSpacing = 5 // design 1d: action item list gap 5
+        paragraph.lineHeightMultiple = bulletLineHeightMultiple
         paragraph.lineBreakMode = .byWordWrapping
         let base: [NSAttributedString.Key: Any] = [
             .font: bodyFont,
@@ -129,11 +210,15 @@ enum MarkdownMiniRenderer {
         if let checkbox {
             // Static checkbox glyph + hanging indent (design 1d: 13 pt box,
             // non-interactive — SPEC §5).
-            paragraph.headIndent = 22
+            paragraph.headIndent = 21 // 13 pt box + 8 pt gap (design 1d)
             let attachment = NSTextAttachment()
             attachment.image = checkbox
             attachment.bounds = CGRect(x: 0, y: bodyFont.descender - 2, width: 13, height: 13)
-            output.append(NSAttributedString(attachment: attachment))
+            // The attachment is the paragraph's FIRST character, so it must
+            // carry the paragraph style — TextKit reads it from there.
+            let glyph = NSMutableAttributedString(attachment: attachment)
+            glyph.addAttributes(base, range: NSRange(location: 0, length: glyph.length))
+            output.append(glyph)
             output.append(NSAttributedString(string: "  ", attributes: base))
             appendInline(text, to: output, base: base)
         } else {
@@ -144,10 +229,10 @@ enum MarkdownMiniRenderer {
         output.append(NSAttributedString(string: "\n", attributes: base))
     }
 
-    private static func appendBody(_ text: String, to output: NSMutableAttributedString) {
+    private static func appendBody(_ text: String, topMargin: CGFloat, to output: NSMutableAttributedString) {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.paragraphSpacingBefore = 2
-        paragraph.paragraphSpacing = 6
+        paragraph.paragraphSpacingBefore = topMargin
+        paragraph.paragraphSpacing = 0
         paragraph.lineHeightMultiple = lineHeightMultiple
         paragraph.lineBreakMode = .byWordWrapping
         let base: [NSAttributedString.Key: Any] = [

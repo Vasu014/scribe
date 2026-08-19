@@ -1,4 +1,5 @@
 import AppKit
+import CaptureKit
 import FusionKit
 import Persistence
 import SessionKit
@@ -36,6 +37,9 @@ final class HistoryWindowController: NSObject {
         static let minWindowSize = NSSize(width: 560, height: 340)
         static let sidebarWidth: CGFloat = 236
         static let rowHeight: CGFloat = 44
+        /// Sidebar top inset: traffic lights (16 + 12 + 14, design 1d) plus
+        /// the row list's own 2 pt top padding.
+        static let sidebarTopInset: CGFloat = 44
         /// List-refresh cadence while a fusing row exists (spinner rows).
         static let fusingTick: TimeInterval = 1
     }
@@ -59,7 +63,34 @@ final class HistoryWindowController: NSObject {
     private var evalButton: NSButton!
     private var deleteButton: NSButton!
     private var contentTextView: NSTextView!
+    /// Owns the TextKit 1 stack behind `contentTextView` (an `NSLayoutManager`
+    /// holds its storage weakly).
+    private var contentTextStorage: NSTextStorage!
     private var emptyStateView: NSView!
+    /// Empty-state Start Meeting (design 2d) — the keyboard entry point when
+    /// there is no table to focus.
+    private var emptyStateStartButton: NSButton!
+
+    // MARK: Start-flow permission guard (UX review finding 7)
+
+    /// Fires INSTEAD of starting when microphone or Screen Recording TCC is
+    /// missing — the same contract as `MenuBarController.onPermissionsMissing`
+    /// so both Start affordances behave identically (design 3a J2).
+    ///
+    /// `ScribeApp` does not inject this today (it wires only the menu bar), so
+    /// when it is `nil` the controller opens the setup wizard itself rather
+    /// than leaving a dead button. Wiring it to the app's shared wizard is the
+    /// preferred fix once `ScribeApp` can be edited.
+    var onPermissionsMissing: (() -> Void)?
+
+    /// Mirrors `MenuBarController.permissionGuardEnabled`: the stub capture
+    /// engine needs no TCC, so the guard is off in that mode. Read from the
+    /// same UserDefaults flag `ScribeApp` branches on, so the two surfaces
+    /// agree without extra wiring.
+    var permissionGuardEnabled = !UserDefaults.standard.bool(forKey: SettingsKeys.debugUseStubCapture)
+
+    /// Wizard used only when `onPermissionsMissing` is unwired (see above).
+    private var fallbackWizard: SetupWizardController?
 
     /// Sessions newest-first (store order).
     private var sessions: [SessionRecord] = []
@@ -81,6 +112,23 @@ final class HistoryWindowController: NSObject {
     private var eventTask: Task<Void, Never>?
     private var fusingTimer: Timer?
 
+    /// Whether the window is OPEN, tracked by the controller instead of asked
+    /// of AppKit. `NSWindow.isVisible` is still `true` inside
+    /// `windowWillClose(_:)`, so a teardown check written as `window.isVisible`
+    /// there reads "still open" and tears nothing down: the 1 s fusing timer
+    /// used to survive the close and keep querying SQLite behind a window that
+    /// no longer exists (measured: it outlived the close and only stopped when
+    /// its OWN next tick re-ran the check — one full store query pass per
+    /// close, on a dead window, and nothing in the design guarantees that
+    /// self-correction). Set on `show()`, cleared on `windowWillClose(_:)`.
+    private var isWindowOpen = false
+
+    /// True only while the window is open AND on screen (not closed, not
+    /// miniaturized). Every "is this window live?" check goes through here.
+    private var isWindowOnScreen: Bool {
+        isWindowOpen && window.isVisible
+    }
+
     init(store: MeetingStore, coordinator: SessionCoordinator) {
         self.store = store
         self.coordinator = coordinator
@@ -94,35 +142,86 @@ final class HistoryWindowController: NSObject {
 
     /// Opens the window (menu History… path).
     func show() {
+        isWindowOpen = true
         reload()
         NSApp.activate(ignoringOtherApps: true) // LSUIElement accessory app
         window.makeKeyAndOrderFront(nil)
+        focusPrimaryResponder()
         syncFusingTimer()
     }
 
     /// Opens the window AT a session (menu-bar done-badge click, SPEC §5).
     func show(sessionId: UUID) {
+        isWindowOpen = true
         reload(selecting: sessionId)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        focusPrimaryResponder()
         syncFusingTimer()
+    }
+
+    /// Puts keyboard focus where the window's navigation actually lives (UX
+    /// review finding 14): the session list, or — with no sessions — the
+    /// empty state's Start Meeting. Without this the window opened with the
+    /// window itself as first responder and the arrow keys did nothing until
+    /// the user clicked a row.
+    private func focusPrimaryResponder() {
+        let target: NSView = sessions.isEmpty ? emptyStateStartButton : tableView
+        window.initialFirstResponder = target
+        // NSButton only accepts first responder under Full Keyboard Access;
+        // the table always does, so the common case always lands.
+        window.makeFirstResponder(target)
+    }
+
+    // MARK: - Gallery test seams (dev tooling — App/UIGallery.swift)
+
+    /// The window, for placement + `windowNumber` in the screenshot gallery.
+    var galleryWindow: NSWindow { window }
+
+    /// Puts the window in a fixed, screenshot-able state without a live
+    /// session. Needed because two inputs of this surface are not reachable
+    /// from the store: the Notes|Transcript segment (private control) and
+    /// `fusionFailures`, which SPEC §5 keeps IN MEMORY, fed only by
+    /// `.fusionFailed` coordinator events that a fixture store can never
+    /// emit. Everything else — rows, meta, validator cards — still comes
+    /// from the real `reload()` path.
+    func galleryConfigure(select sessionId: UUID?, tab: Int, failed: [UUID: String]) {
+        fusionFailures = failed
+        segmented.selectedSegment = tab
+        reload(selecting: sessionId)
     }
 
     // MARK: - Window assembly (design 1d)
 
     private func buildWindow() {
-        window = NSWindow(
+        // `HistoryWindow` only adds the ⌘1/⌘2 pane toggle (UX review finding
+        // 14) — a key path AppKit cannot express as a control key equivalent.
+        // Closing is plain `performClose:` from the app's Window menu (⌘W).
+        let historyWindow = HistoryWindow(
             contentRect: .zero,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        window.title = "History"
+        historyWindow.onKeyEquivalent = { [weak self] event in
+            self?.handleKeyEquivalent(event) ?? false
+        }
+        window = historyWindow
+        // Design 1d: no title strip — the content runs full height and the
+        // traffic lights float over the top of the sidebar.
+        window.title = "History" // Window menu / accessibility only
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
         window.minSize = Metrics.minWindowSize
 
         let split = NSSplitViewController()
-        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarViewController())
+        // A PLAIN item, not `sidebarWithViewController:`: on macOS 26 the
+        // sidebar behavior wraps the item's view in a concentric-glass
+        // container — an inset, rounded "card" around the list that design 1d
+        // does not have, and which also steals row width. The source-list
+        // material is drawn by our own NSVisualEffectView, full-bleed.
+        let sidebarItem = NSSplitViewItem(viewController: sidebarViewController())
         sidebarItem.canCollapse = false
         sidebarItem.minimumThickness = Metrics.sidebarWidth
         sidebarItem.maximumThickness = Metrics.sidebarWidth
@@ -140,8 +239,6 @@ final class HistoryWindowController: NSObject {
         // swaps between the two faces (opaque background so the sidebar
         // material doesn't show through).
         emptyStateView = buildEmptyStateView()
-        emptyStateView.wantsLayer = true
-        emptyStateView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         emptyStateView.isHidden = true
         split.view.addSubview(emptyStateView)
         NSLayoutConstraint.activate([
@@ -150,6 +247,18 @@ final class HistoryWindowController: NSObject {
             emptyStateView.leadingAnchor.constraint(equalTo: split.view.leadingAnchor),
             emptyStateView.trailingAnchor.constraint(equalTo: split.view.trailingAnchor),
         ])
+
+        // Keyboard traversal (UX review finding 14): an explicit key-view loop
+        // so Tab under Full Keyboard Access walks list → pane toggle → the
+        // four actions → back to the list, instead of AppKit's incidental
+        // geometric order across two split-view children.
+        window.initialFirstResponder = tableView
+        tableView.nextKeyView = segmented
+        segmented.nextKeyView = exportButton
+        exportButton.nextKeyView = retryButton
+        retryButton.nextKeyView = evalButton
+        evalButton.nextKeyView = deleteButton
+        deleteButton.nextKeyView = tableView
     }
 
     /// 236 pt source-list sidebar: sidebar material + plain view-based
@@ -160,7 +269,13 @@ final class HistoryWindowController: NSObject {
 
         let effect = NSVisualEffectView()
         effect.material = .sidebar // native source-list material ≈ design #F2F1EF
-        effect.blendingMode = .behindWindow
+        // `.withinWindow`, not `.behindWindow`: sampling the desktop makes the
+        // sidebar as light (or dark) as whatever happens to sit behind the
+        // window, which flips design 1d's sidebar/detail relationship — over a
+        // white background the sidebar rendered LIGHTER than the notes pane.
+        // Sampling the window keeps the sidebar the recessed surface and the
+        // detail pane the content surface in both appearances.
+        effect.blendingMode = .withinWindow
         effect.state = .active
         effect.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(effect)
@@ -168,15 +283,33 @@ final class HistoryWindowController: NSObject {
         tableView.headerView = nil
         tableView.rowHeight = Metrics.rowHeight
         tableView.intercellSpacing = NSSize(width: 0, height: 2) // design row gap 2
+        // `.plain`: inside an NSSplitViewItem sidebar the `.automatic` style
+        // resolves to the source-list style, which (macOS 26) both insets the
+        // rows — squeezing the 13 pt titles into an early ellipsis — and paints
+        // a rounded "card" behind the list that design 1d does not have. The
+        // row list's own padding comes from the scroll view's constraints.
+        tableView.style = .plain
         tableView.backgroundColor = .clear
-        tableView.focusRingType = .none
+        // The focus ring stays ON (UX review finding 14): it is the only
+        // indicator that tells a keyboard user the session list — the window's
+        // primary navigation — currently has focus. `SidebarRowView` adds the
+        // second signal by drawing the emphasized selection fill.
+        tableView.focusRingType = .default
+        // VoiceOver: the table is unlabeled otherwise ("table").
+        tableView.setAccessibilityLabel("Sessions")
         tableView.dataSource = self
         tableView.delegate = self
         tableView.addTableColumn(NSTableColumn(identifier: Self.cellIdentifier))
 
         let scroll = NSScrollView()
         scroll.documentView = tableView
+        // Flat, full-bleed under the sidebar material (design 1d): every layer
+        // of the scroll stack has to opt out of drawing, otherwise the clip
+        // view fills its bounds with the control background.
         scroll.drawsBackground = false
+        scroll.backgroundColor = .clear
+        scroll.contentView.drawsBackground = false
+        scroll.automaticallyAdjustsContentInsets = false
         scroll.borderType = .noBorder
         scroll.hasVerticalScroller = true
         scroll.verticalScroller?.scrollerStyle = .overlay
@@ -188,10 +321,13 @@ final class HistoryWindowController: NSObject {
             effect.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             effect.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             effect.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: container.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            // Top inset clears the OS traffic lights (design 1d: 16/16/14 →
+            // 12 pt circles at 16 from the top + 14 below); row list padding
+            // is 2px 8px 12px.
+            scroll.topAnchor.constraint(equalTo: container.topAnchor, constant: Metrics.sidebarTopInset),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
         ])
         let controller = NSViewController()
         controller.view = container
@@ -201,42 +337,69 @@ final class HistoryWindowController: NSObject {
     /// Detail pane: toolbar (segmented Notes | Transcript + four actions,
     /// hairline bottom) over the content text view.
     private func detailViewController() -> NSViewController {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        // Content surface (design 1d: the notes pane is `#fff` beside the
+        // `#F2F1EF` source-list sidebar) — `windowBackgroundColor` inverts that
+        // contrast in light mode.
+        let container = ContentBackdropView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
 
         segmented.font = NSFont.systemFont(ofSize: 12) // design 1d: 12 pt segments
         segmented.selectedSegment = 0
+        segmented.setAccessibilityLabel("View")
+        segmented.toolTip = "Notes (⌘1) or Transcript (⌘2)" // discoverability for the key path
 
-        exportButton = makeToolbarButton("Export", action: #selector(exportTapped))
-        retryButton = makeToolbarButton("Retry Fusion", action: #selector(retryTapped))
-        evalButton = makeToolbarButton("Export Eval Case", action: #selector(exportEvalTapped))
-        deleteButton = makeToolbarButton("Delete", action: #selector(deleteTapped), red: true)
+        exportButton = makeToolbarButton(
+            "Export", action: #selector(exportTapped), key: "e", help: "Export notes and transcript as Markdown"
+        )
+        retryButton = makeToolbarButton(
+            "Retry Fusion", action: #selector(retryTapped), key: "r", help: "Run fusion again for this session"
+        )
+        evalButton = makeToolbarButton(
+            "Export Eval Case", action: #selector(exportEvalTapped),
+            key: "E", modifiers: [.command, .shift], help: "Export this session as an eval case"
+        )
+        deleteButton = makeToolbarButton(
+            "Delete", action: #selector(deleteTapped), red: true,
+            key: "\u{8}", help: "Delete this session (asks first)"
+        )
 
         let toolbar = NSStackView(views: [
             segmented, toolbarSpacer(), exportButton, retryButton, evalButton, deleteButton,
         ])
         toolbar.orientation = .horizontal
         toolbar.alignment = .centerY
-        toolbar.spacing = 8
+        toolbar.spacing = 10 // design 1d toolbar gap
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(toolbar)
 
-        let hairline = NSView()
-        hairline.wantsLayer = true
-        hairline.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.08).cgColor
+        let hairline = HairlineView()
         hairline.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(hairline)
 
-        contentTextView = NSTextView(frame: .zero)
+        // Explicit TextKit 1 stack: the inline validator cards (design 1d)
+        // are drawn from line-fragment geometry, which needs NSLayoutManager.
+        let storage = NSTextStorage()
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let textContainer = NSTextContainer(
+            size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        )
+        layout.addTextContainer(textContainer)
+        contentTextStorage = storage
+        contentTextView = NotesTextView(frame: .zero, textContainer: textContainer)
         contentTextView.isEditable = false
         contentTextView.isSelectable = true
         contentTextView.isRichText = false
         contentTextView.drawsBackground = false
         contentTextView.isVerticallyResizable = true
         contentTextView.isHorizontallyResizable = false
+        contentTextView.minSize = .zero
+        contentTextView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude
+        )
         contentTextView.autoresizingMask = [.width]
         contentTextView.textContainer?.widthTracksTextView = true
         contentTextView.textContainer?.lineFragmentPadding = 0
-        contentTextView.textContainerInset = NSSize(width: 24, height: 18) // padding 20/24 (design 1d)
+        contentTextView.textContainerInset = NSSize(width: 24, height: 20) // padding 20/24/26 (design 1d)
 
         let scroll = NSScrollView()
         scroll.documentView = contentTextView
@@ -276,7 +439,21 @@ final class HistoryWindowController: NSObject {
 
     /// Bordered 12 pt toolbar button (design 1d: radius 6, 0.5 pt border);
     /// Delete variant renders its title in the failure red #E0483E.
-    private func makeToolbarButton(_ title: String, action: Selector, red: Bool = false) -> NSButton {
+    ///
+    /// `key` gives the action a ⌘ equivalent (UX review finding 14): without
+    /// one these four buttons were reachable only with Full Keyboard Access
+    /// turned on. The equivalent is echoed in the tooltip because nothing else
+    /// in this window advertises it, and it fires only while the button is
+    /// enabled — `NSButton.performKeyEquivalent` checks `isEnabled` itself, so
+    /// the `updateActions` enablement rules cover the keyboard path too.
+    private func makeToolbarButton(
+        _ title: String,
+        action: Selector,
+        red: Bool = false,
+        key: String,
+        modifiers: NSEvent.ModifierFlags = [.command],
+        help: String
+    ) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .texturedRounded
         button.font = NSFont.systemFont(ofSize: 12)
@@ -286,32 +463,64 @@ final class HistoryWindowController: NSObject {
                 .foregroundColor: HistoryMeta.failureColor,
             ])
         }
+        button.keyEquivalent = key
+        button.keyEquivalentModifierMask = modifiers
+        button.toolTip = "\(help) (\(Self.shortcutLabel(key: key, modifiers: modifiers)))"
+        button.setAccessibilityLabel(title)
+        button.setAccessibilityHelp(help)
         button.isEnabled = false // enabled by selection state (updateActions)
         return button
+    }
+
+    /// "⌘E" / "⇧⌘E" / "⌘⌫" — the tooltip's shortcut suffix.
+    private static func shortcutLabel(key: String, modifiers: NSEvent.ModifierFlags) -> String {
+        var label = ""
+        if modifiers.contains(.control) { label += "⌃" }
+        if modifiers.contains(.option) { label += "⌥" }
+        if modifiers.contains(.shift) { label += "⇧" }
+        if modifiers.contains(.command) { label += "⌘" }
+        switch key {
+        case "\u{8}", "\u{7f}": return label + "⌫"
+        default: return label + key.uppercased()
+        }
     }
 
     /// Empty state (design 2d): centered gray waveform + "No sessions yet" +
     /// caption + bordered Start Meeting button.
     private func buildEmptyStateView() -> NSView {
-        let view = NSView()
+        // Opaque backdrop so the sidebar material doesn't show through; drawn
+        // (not a CALayer color) so it follows appearance changes.
+        let view = BackdropView()
         view.translatesAutoresizingMaskIntoConstraints = false
 
         let glyph = NSImageView(image: HistoryGlyphs.emptyWaveform)
+        // Decorative (the title beneath says it): keep it out of the AX tree
+        // rather than let VoiceOver announce a bare "image". The cell carries
+        // the image view's accessibility in AppKit, so both are silenced.
+        glyph.setAccessibilityElement(false)
+        glyph.cell?.setAccessibilityElement(false)
 
         let title = NSTextField(labelWithString: "No sessions yet")
         title.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
-        title.textColor = NSColor.labelColor.withAlphaComponent(0.65)
+        title.textColor = NSColor.labelColor.withAlphaComponent(0.65) // ≈5.9:1 — passes AA
 
         let caption = NSTextField(wrappingLabelWithString:
             "Start a meeting from the menu bar. Notes land here when fusion finishes.")
         caption.font = NSFont.systemFont(ofSize: 12)
-        caption.textColor = NSColor.labelColor.withAlphaComponent(0.40)
+        // Design 2d asks for black 40%, which is ≈2.8:1 on white — a WCAG AA
+        // failure (UX review finding 20). `secondaryLabelColor` is the native
+        // caption color the rest of this window already uses (≈4.6:1), and
+        // design/README's "always prefer the native system equivalent" makes
+        // that the correction rather than a deviation.
+        caption.textColor = .secondaryLabelColor
         caption.alignment = .center
         caption.widthAnchor.constraint(equalToConstant: 280).isActive = true
 
         let start = NSButton(title: "Start Meeting", target: self, action: #selector(startMeetingTapped))
         start.bezelStyle = .rounded // bordered native push button (design 2d)
         start.controlSize = .regular
+        start.setAccessibilityHelp("Starts a meeting and begins recording")
+        emptyStateStartButton = start
 
         let stack = NSStackView(views: [glyph, title, caption, start])
         stack.orientation = .vertical
@@ -436,11 +645,15 @@ final class HistoryWindowController: NSObject {
 
     private func renderDetail() {
         guard let detail else { return }
-        let attributed = segmented.selectedSegment == 0
-            ? renderNotes(detail)
-            : renderTranscript(detail)
+        let isNotes = segmented.selectedSegment == 0
+        let attributed = isNotes ? renderNotes(detail) : renderTranscript(detail)
         contentTextView.textStorage?.setAttributedString(attributed)
         contentTextView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        // VoiceOver: which face of the pane is showing (the segmented control
+        // is a separate element and is not read with the text).
+        contentTextView.setAccessibilityLabel(
+            isNotes ? "Notes for \(detail.displayTitle)" : "Transcript for \(detail.displayTitle)"
+        )
     }
 
     /// Notes face (design 1d): 17 pt semibold title, meta line
@@ -449,24 +662,37 @@ final class HistoryWindowController: NSObject {
     private func renderNotes(_ detail: SessionDetail) -> NSAttributedString {
         let out = NSMutableAttributedString()
 
-        let title = detail.displayTitle
-        out.append(NSAttributedString(string: title + "\n", attributes: [
+        let titleParagraph = NSMutableParagraphStyle()
+        titleParagraph.paragraphSpacing = 3 // meta line margin-top (design 1d)
+        out.append(NSAttributedString(string: detail.displayTitle + "\n", attributes: [
             .font: NSFont.systemFont(ofSize: 17, weight: .semibold),
             .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: titleParagraph,
         ]))
-        out.append(NSAttributedString(string: metaLine(detail) + "\n\n", attributes: [
+
+        let metaParagraph = NSMutableParagraphStyle()
+        metaParagraph.paragraphSpacing = 14 // meta line margin-bottom (design 1d)
+        out.append(NSAttributedString(string: metaLine(detail) + "\n", attributes: [
             .font: NSFont.systemFont(ofSize: 11.5),
             .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: metaParagraph,
         ]))
 
         if let note = detail.note {
             // SPEC §4.5 validator: re-run on display — deterministic, no
             // model calls, no stored findings needed.
             let findings = NotesValidator.validate(markdown: note.markdown, segments: detail.segments)
-            for finding in findings {
-                out.append(validatorCard(finding))
+            let body = NSMutableAttributedString(
+                attributedString: MarkdownMiniRenderer.render(note.markdown, checkbox: HistoryGlyphs.checkbox)
+            )
+            if !findings.isEmpty {
+                // Design 1d: the card sits INSIDE the notes flow, after the
+                // summary body and before the next section label.
+                let cards = NSMutableAttributedString()
+                for finding in findings { cards.append(validatorCard(finding)) }
+                body.insert(cards, at: MarkdownMiniRenderer.endOfFirstSection(in: body))
             }
-            out.append(MarkdownMiniRenderer.render(note.markdown, checkbox: HistoryGlyphs.checkbox))
+            out.append(body)
         } else {
             out.append(statusLine(for: detail))
         }
@@ -495,36 +721,50 @@ final class HistoryWindowController: NSObject {
         return text
     }
 
-    /// Inline validator warning card (SPEC §4.5; design 1d): systemYellow 12%
-    /// fill, ⚠ glyph, 12 pt text. TextKit per-run backgrounds cannot express
-    /// the design's radius-7 card + border without TextKit block extras —
-    /// rendered as highlighted ⚠ paragraphs instead (deliberate, SPEC §5
-    /// "do not invest").
+    /// Inline validator warning card (SPEC §4.5; design 1d): a real block
+    /// card — systemYellow 12% fill, radius 7, 0.5 pt border, warning glyph
+    /// top-left, 12 pt text at 1.5 line-height, 10 pt above.
+    ///
+    /// The card is ONE paragraph carrying `ValidatorCard.attribute`; the
+    /// rounded fill + border are drawn behind it by `NotesTextView` from the
+    /// paragraph's line-fragment geometry, so it tracks the pane's real width
+    /// on resize and resolves its colors per appearance. The paragraph
+    /// indents supply the card's inner padding.
     private func validatorCard(_ finding: NotesValidator.Finding) -> NSAttributedString {
-        let fill = NSColor.systemYellow.withAlphaComponent(0.12)
         let paragraph = NSMutableParagraphStyle()
-        paragraph.paragraphSpacingBefore = 6
-        paragraph.paragraphSpacing = 8
+        paragraph.paragraphSpacingBefore = ValidatorCard.marginTop + ValidatorCard.paddingY
+        paragraph.paragraphSpacing = ValidatorCard.paddingY
+        paragraph.firstLineHeadIndent = ValidatorCard.paddingX
+        paragraph.headIndent = ValidatorCard.paddingX + ValidatorCard.glyphSize.width + ValidatorCard.glyphGap
+        paragraph.tailIndent = -ValidatorCard.paddingX
         paragraph.lineBreakMode = .byWordWrapping
-        paragraph.lineHeightMultiple = 1.3
+        paragraph.lineHeightMultiple = 1.25 // design 12 pt / 1.5
+
+        let font = NSFont.systemFont(ofSize: 12)
+        let base: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.secondaryLabelColor, // design black 65%
+            .paragraphStyle: paragraph,
+        ]
 
         let card = NSMutableAttributedString()
-        card.append(NSAttributedString(string: "⚠ ", attributes: [
-            .font: NSFont.systemFont(ofSize: 12),
-            .foregroundColor: NSColor(srgbRed: 0xE6 / 255, green: 0xA7 / 255, blue: 0, alpha: 1),
-            .backgroundColor: fill,
-        ]))
-        card.append(NSAttributedString(string: "Validator: ", attributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: NSColor.labelColor.withAlphaComponent(0.75),
-            .backgroundColor: fill,
-        ]))
-        card.append(NSAttributedString(string: finding.detail, attributes: [
-            .font: NSFont.systemFont(ofSize: 12),
-            .foregroundColor: NSColor.labelColor.withAlphaComponent(0.65),
-            .backgroundColor: fill,
-        ]))
-        card.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: card.length))
+        let glyph = NSTextAttachment()
+        glyph.image = HistoryGlyphs.validatorWarning
+        glyph.bounds = CGRect(
+            x: 0, y: font.descender - 1,
+            width: ValidatorCard.glyphSize.width, height: ValidatorCard.glyphSize.height
+        )
+        card.append(NSAttributedString(attachment: glyph))
+        card.append(NSAttributedString(string: "  ", attributes: base))
+        var prefix = base
+        prefix[.font] = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        prefix[.foregroundColor] = NSColor.labelColor // design black 75%
+        card.append(NSAttributedString(string: "Validator: ", attributes: prefix))
+        card.append(NSAttributedString(string: finding.detail + "\n", attributes: base))
+        card.addAttributes(
+            [.paragraphStyle: paragraph, ValidatorCard.attribute: true],
+            range: NSRange(location: 0, length: card.length)
+        )
         return card
     }
 
@@ -657,20 +897,72 @@ final class HistoryWindowController: NSObject {
         }
     }
 
-    /// Empty-state Start Meeting (design 2d) — errors logged (start failures
-    /// surface through the menu bar / setup wizard surfaces).
+    /// Empty-state Start Meeting (design 2d), guarded exactly like the menu's
+    /// Start (UX review finding 7).
+    ///
+    /// This used to call `coordinator.start()` straight through and log the
+    /// throw: with microphone or Screen Recording TCC missing the button did
+    /// nothing at all, with no feedback — a dead control on the one surface a
+    /// user with no sessions ever sees. Now missing permissions open the setup
+    /// wizard at the missing step (same as `MenuBarController.toggleMeeting`),
+    /// and a genuine engine failure is surfaced as a sheet, never log-only.
     @objc private func startMeetingTapped() {
+        // T8 start guard: a start without TCC throws (mic) or silently
+        // degrades to mic-only (screen) — route to the wizard instead.
+        if permissionGuardEnabled,
+           CapturePermissions.microphone != .granted
+            || CapturePermissions.screenRecording == .denied {
+            presentPermissionSetup()
+            return
+        }
         Task { @MainActor in
             do {
                 try await coordinator.start()
+                reload() // the new session row replaces the empty state
             } catch {
-                logger.error("Meeting start failed from History: \(String(describing: error), privacy: .public)")
+                presentError("Couldn't start the meeting", error)
             }
         }
     }
 
+    /// Hands a missing-permission start to the host, or — unwired — opens the
+    /// wizard directly, so the button always does something visible.
+    private func presentPermissionSetup() {
+        if let onPermissionsMissing {
+            onPermissionsMissing()
+            return
+        }
+        guard let step = SetupWizardPhase.firstMissingPermission else {
+            logger.error("Permission guard fired with no missing permission — start not attempted.")
+            return
+        }
+        if fallbackWizard == nil { fallbackWizard = SetupWizardController() }
+        fallbackWizard?.show(at: step)
+    }
+
     @objc private func modeChanged() {
         refreshDetailIfNeeded() // mode is part of the render key
+    }
+
+    /// ⌘1 / ⌘2 — the Notes ⇄ Transcript toggle's key path (UX review finding
+    /// 14; design 3a J3's `⟲ Notes ⇄ Transcript` is otherwise mouse-only).
+    /// Everything else in this window is a control key equivalent or a main
+    /// menu item, so nothing else is intercepted here.
+    private func handleKeyEquivalent(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+              window.attachedSheet == nil else { return false }
+        switch event.charactersIgnoringModifiers {
+        case "1": selectMode(0)
+        case "2": selectMode(1)
+        default: return false
+        }
+        return true
+    }
+
+    private func selectMode(_ index: Int) {
+        guard segmented.selectedSegment != index else { return }
+        segmented.selectedSegment = index
+        modeChanged()
     }
 
     // MARK: - Eval-case sheet (SPEC §4.5 collection path)
@@ -778,17 +1070,32 @@ final class HistoryWindowController: NSObject {
 
     // MARK: - Panels & errors
 
+    /// Save panel as a WINDOW-modal sheet (UX review finding 22).
+    ///
+    /// `runModal()` is app-modal: it froze the status item — the app's
+    /// persistent root — for as long as the panel was open, which design 3b's
+    /// "No modal states anywhere" forbids. A sheet on the History window keeps
+    /// the menu bar (and Stop) live.
+    ///
+    /// Presented on the next run-loop pass because the eval-case path calls
+    /// this from `beginSheet`'s completion handler, and AppKit refuses a
+    /// second sheet while the first is still being torn down.
     private func savePanel(defaultName: String, type: UTType, data: Data) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [type]
         panel.nameFieldStringValue = defaultName
         panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try data.write(to: url, options: .atomic)
-            logger.info("Exported \(url.lastPathComponent, privacy: .public)")
-        } catch {
-            presentError("Couldn't save \(url.lastPathComponent)", error)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            panel.beginSheetModal(for: self.window) { [weak self] response in
+                guard let self, response == .OK, let url = panel.url else { return }
+                do {
+                    try data.write(to: url, options: .atomic)
+                    self.logger.info("Exported \(url.lastPathComponent, privacy: .public)")
+                } catch {
+                    self.presentError("Couldn't save \(url.lastPathComponent)", error)
+                }
+            }
         }
     }
 
@@ -802,13 +1109,19 @@ final class HistoryWindowController: NSObject {
         return "\(base).\(ext)"
     }
 
+    /// Window-modal error sheet (never log-only — UX review finding 7).
+    /// Deferred one run-loop pass for the same reason `savePanel` is: the
+    /// callers are sheet completion handlers.
     private func presentError(_ message: String, _ error: Error) {
         logger.error("\(message, privacy: .public): \(String(describing: error), privacy: .public)")
-        let alert = NSAlert()
-        alert.messageText = message
-        alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "OK")
-        alert.beginSheetModal(for: window)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let alert = NSAlert()
+            alert.messageText = message
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.beginSheetModal(for: self.window)
+        }
     }
 
     // MARK: - Events & timers
@@ -829,21 +1142,25 @@ final class HistoryWindowController: NSObject {
     private func handle(_ event: CoordinatorEvent) {
         switch event {
         case .stateChanged, .fusionFindings:
-            if window.isVisible { reload() }
+            if isWindowOnScreen { reload() }
         case .fusionFailed(let sessionId, let message):
             fusionFailures[sessionId] = message
-            if window.isVisible { reload() }
+            if isWindowOnScreen { reload() }
         case .recoveredSessions:
-            if window.isVisible { reload() }
-        case .deviceEventLogged:
-            break
+            if isWindowOnScreen { reload() }
+        case .deviceEventLogged, .transcriptDrainTimedOut:
+            break // logged by ScribeApp; the session row itself is unaffected
         }
     }
 
     /// 1 s list refresh while a "fusing" row exists (spec'd data path for
     /// fusing rows; stopped when the window is closed or none remain).
+    ///
+    /// The liveness test is `isWindowOnScreen`, NOT `window.isVisible`: this
+    /// is called from `windowWillClose(_:)`, where AppKit still reports the
+    /// window as visible.
     private func syncFusingTimer() {
-        let needsTimer = window.isVisible && sessions.contains { rowState($0) == .fusing }
+        let needsTimer = isWindowOnScreen && sessions.contains { rowState($0) == .fusing }
         if needsTimer, fusingTimer == nil {
             let timer = Timer(timeInterval: Metrics.fusingTick, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -930,7 +1247,20 @@ extension HistoryWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
 extension HistoryWindowController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
+        // Order matters: the window is still `isVisible` here, so the flag
+        // must drop BEFORE the sync or the timer survives the close.
+        isWindowOpen = false
         syncFusingTimer() // stops the fusing tick while closed
+    }
+
+    /// Miniaturizing clears `isVisible`; the timer is only re-armed when the
+    /// window comes back, so the tick does not run behind the Dock icon.
+    func windowDidMiniaturize(_ notification: Notification) {
+        syncFusingTimer()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        reload() // re-reads the store and re-arms the tick if a row is fusing
     }
 }
 
@@ -962,14 +1292,158 @@ private struct DetailKey: Equatable {
     let mode: Int
 }
 
+// MARK: - Window
+
+/// History window. Adds ONE thing to `NSWindow`: the ⌘1 / ⌘2 pane toggle
+/// (UX review finding 14). `NSSegmentedControl` has no per-segment modifier
+/// mask, so the toggle cannot be expressed as a control key equivalent, and it
+/// does not belong in the app's main menu (it is meaningful only here).
+///
+/// Closing is deliberately NOT overridden: ⌘W comes from the app's Window
+/// menu → `performClose:`, which this window services normally (`.closable`,
+/// `isReleasedWhenClosed = false`, `windowWillClose` clears `isWindowOpen`
+/// and stops the fusing timer).
+private final class HistoryWindow: NSWindow {
+    /// Returns true when the controller consumed the event.
+    var onKeyEquivalent: ((NSEvent) -> Bool)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if onKeyEquivalent?(event) == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 // MARK: - Sidebar rows
 
-/// Selection fill for sidebar rows (design 1d: radius 6, black 7%).
+/// Selection fill for sidebar rows (design 1d: radius 6, neutral — black 7%
+/// on light). `unemphasizedSelectedContentBackgroundColor` is the native
+/// source-list equivalent and is the only one that stays a *highlight* in
+/// dark mode; it resolves here because selection is drawn, not layered.
+///
+/// `isEmphasized` (window is key AND the table is first responder) adds an
+/// accent-colored outline around that same fill — the second half of the focus
+/// indicator restored for UX review finding 14, so arrow-key navigation is
+/// visibly *live* rather than merely remembered. An outline rather than
+/// AppKit's accent FILL on purpose: the row's labels are custom (not the
+/// cell's `textField`), so they never flip to white and dark-on-accent would
+/// trade one contrast failure for another.
 private final class SidebarRowView: NSTableRowView {
     override func drawSelection(in dirtyRect: NSRect) {
         guard selectionHighlightStyle != .none else { return }
-        NSColor.black.withAlphaComponent(0.07).setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
+        NSColor.unemphasizedSelectedContentBackgroundColor.setFill()
+        shape.fill()
+        guard isEmphasized else { return }
+        NSColor.controlAccentColor.setStroke()
+        shape.lineWidth = 2
+        shape.stroke()
+    }
+}
+
+// MARK: - Appearance-following primitives
+//
+// CALayer colors do NOT re-resolve when the effective appearance changes, so
+// every tinted surface in this window draws itself instead.
+
+/// 0.5 pt `separatorColor` hairline (design 1d toolbar/sidebar borders).
+private final class HairlineView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.setFill()
+        dirtyRect.fill()
+    }
+}
+
+/// Opaque content-surface backdrop for the detail pane (design 1d: `#fff`).
+/// `textBackgroundColor` is the semantic content surface — white in light,
+/// near-black in dark — which puts the notes pane on the light side of the
+/// sidebar material in Aqua and the dark side in Dark Aqua.
+private final class ContentBackdropView: NSView {
+    override var isOpaque: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.textBackgroundColor.setFill()
+        dirtyRect.fill()
+    }
+}
+
+/// Opaque window-background backdrop (design 2d empty state).
+private final class BackdropView: NSView {
+    override var isOpaque: Bool { true }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        dirtyRect.fill()
+    }
+}
+
+/// `recovered` tag capsule (design 1d): systemYellow 22% fill, radius 4.
+private final class TagCapsuleView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.systemYellow.withAlphaComponent(0.22).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 4, yRadius: 4).fill()
+    }
+}
+
+// MARK: - Validator card (design 1d)
+
+/// Geometry + the marker attribute for the inline validator warning card.
+private enum ValidatorCard {
+    /// Marks the card paragraph so `NotesTextView` can draw its block.
+    static let attribute = NSAttributedString.Key("scribe.history.validatorCard")
+    static let marginTop: CGFloat = 10
+    static let paddingX: CGFloat = 10
+    static let paddingY: CGFloat = 8
+    static let cornerRadius: CGFloat = 7
+    static let glyphSize = NSSize(width: 13, height: 12)
+    static let glyphGap: CGFloat = 8
+}
+
+/// Notes pane text view. Draws the validator warning cards (design 1d) as
+/// real rounded blocks behind their paragraphs, sized from the live line
+/// fragments so they follow the pane's actual width.
+private final class NotesTextView: NSTextView {
+
+    override func draw(_ dirtyRect: NSRect) {
+        drawValidatorCards()
+        super.draw(dirtyRect)
+    }
+
+    private func drawValidatorCards() {
+        guard let layoutManager, let container = textContainer, let storage = textStorage,
+              storage.length > 0 else { return }
+        let origin = textContainerOrigin
+        let inset = container.lineFragmentPadding
+        let width = container.size.width - inset * 2
+        guard width > 0 else { return }
+
+        storage.enumerateAttribute(
+            ValidatorCard.attribute,
+            in: NSRange(location: 0, length: storage.length),
+            options: []
+        ) { value, range, _ in
+            guard value != nil else { return }
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            var used = NSRect.null
+            layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, usedRect, _, _, _ in
+                used = used.union(usedRect)
+            }
+            guard !used.isNull, !used.isEmpty else { return }
+
+            let card = NSRect(
+                x: origin.x + inset,
+                y: origin.y + used.minY - ValidatorCard.paddingY,
+                width: width,
+                height: used.height + ValidatorCard.paddingY * 2
+            )
+            let path = NSBezierPath(
+                roundedRect: card.insetBy(dx: 0.25, dy: 0.25),
+                xRadius: ValidatorCard.cornerRadius,
+                yRadius: ValidatorCard.cornerRadius
+            )
+            NSColor.systemYellow.withAlphaComponent(0.12).setFill() // design rgba(255,204,0,.12)
+            path.fill()
+            NSColor.systemYellow.withAlphaComponent(0.35).setStroke() // design rgba(178,134,0,.25)
+            path.lineWidth = 0.5
+            path.stroke()
+        }
     }
 }
 
@@ -981,7 +1455,7 @@ private final class SessionCellView: NSTableCellView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let dateLabel = NSTextField(labelWithString: "")
     private let metaLabel = NSTextField(labelWithString: "")
-    private let capsule = NSView()
+    private let capsule = TagCapsuleView()
     private let capsuleLabel = NSTextField(labelWithString: "recovered")
     private let spinner = NSProgressIndicator()
     private let metaStack = NSStackView()
@@ -994,11 +1468,11 @@ private final class SessionCellView: NSTableCellView {
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.cell?.truncatesLastVisibleLine = true
         titleLabel.cell?.wraps = false
-        // The title yields to the right-hand meta (design: meta never truncates).
+        // The title takes whatever the meta column leaves and truncates only
+        // then (design: meta never truncates, titles rarely do — the 236 pt
+        // sidebar fits "Design crit — panels" beside a fusing spinner).
         titleLabel.setContentHuggingPriority(NSLayoutConstraint.Priority(249), for: .horizontal)
-        titleLabel.setContentCompressionResistancePriority(
-            NSLayoutConstraint.Priority(249), for: .horizontal
-        )
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         dateLabel.font = NSFont.systemFont(ofSize: 11)
         dateLabel.textColor = .secondaryLabelColor // design black 45%
@@ -1007,11 +1481,10 @@ private final class SessionCellView: NSTableCellView {
         metaLabel.textColor = .secondaryLabelColor
 
         // "recovered" capsule (design 1d): 9 pt medium, systemYellow 22% fill,
-        // #8A6A00 text, radius 4.
-        capsule.wantsLayer = true
-        capsule.layer?.cornerRadius = 4
-        capsule.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.22).cgColor
+        // #8A6A00 text (lightened in dark mode), radius 4 — drawn, not
+        // layered, so it survives an appearance change.
         capsule.isHidden = true
+        capsule.setAccessibilityElement(false) // decorative fill; the label inside reads "recovered"
         capsuleLabel.font = NSFont.systemFont(ofSize: 9, weight: .medium)
         capsuleLabel.textColor = HistoryMeta.capsuleTextColor
         capsuleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -1028,6 +1501,9 @@ private final class SessionCellView: NSTableCellView {
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
         spinner.isHidden = true
+        // VoiceOver: an unlabeled progress indicator otherwise (finding 19).
+        // The adjacent "fusing" label still carries the state visually.
+        spinner.setAccessibilityLabel("Fusing")
         spinner.translatesAutoresizingMaskIntoConstraints = false
         spinner.widthAnchor.constraint(equalToConstant: 10).isActive = true
         spinner.heightAnchor.constraint(equalToConstant: 10).isActive = true
@@ -1036,6 +1512,14 @@ private final class SessionCellView: NSTableCellView {
         metaStack.alignment = .centerY
         metaStack.spacing = 4
         metaStack.setViews([capsule, spinner, metaLabel], in: .leading)
+        // The meta column hugs its content and never compresses; the title
+        // gets the rest. The tight case is a row carrying BOTH the "recovered"
+        // capsule and a meta value.
+        metaStack.setContentHuggingPriority(.required, for: .horizontal)
+        metaStack.setContentCompressionResistancePriority(.required, for: .horizontal)
+        for view in [capsuleLabel, metaLabel] {
+            view.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
 
         for view in [titleLabel, metaStack, dateLabel] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -1081,10 +1565,21 @@ private final class SessionCellView: NSTableCellView {
 /// History text helpers (design 1d). Wall-clock based (SPEC §4.1 — durations
 /// derive from wall clock, never the session clock).
 private enum HistoryMeta {
-    /// Failure text #E0483E (design 1d).
-    static let failureColor = NSColor(srgbRed: 0xE0 / 255, green: 0x48 / 255, blue: 0x3E / 255, alpha: 1)
-    /// Recovered-capsule text #8A6A00 (design 1d).
-    static let capsuleTextColor = NSColor(srgbRed: 0x8A / 255, green: 0x6A / 255, blue: 0x00, alpha: 1)
+    /// Failure text token (design 1d #E0483E). Dynamic: #E0483E reads as mud
+    /// on a dark background, so dark mode falls back to `systemRed`.
+    static let failureColor = NSColor(name: "scribe.history.failure") { appearance in
+        appearance.isDark
+            ? .systemRed
+            : NSColor(srgbRed: 0xE0 / 255, green: 0x48 / 255, blue: 0x3E / 255, alpha: 1)
+    }
+
+    /// Recovered-capsule text (design 1d #8A6A00 on the systemYellow 22%
+    /// fill). Dark mode needs a light-on-dark counterpart.
+    static let capsuleTextColor = NSColor(name: "scribe.history.recoveredTag") { appearance in
+        appearance.isDark
+            ? NSColor(srgbRed: 1, green: 0.84, blue: 0.36, alpha: 1)
+            : NSColor(srgbRed: 0x8A / 255, green: 0x6A / 255, blue: 0x00, alpha: 1)
+    }
 
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -1146,51 +1641,87 @@ private enum HistoryMeta {
     }
 }
 
+private extension NSAppearance {
+    /// True for the dark appearances (used by the dynamic color providers).
+    var isDark: Bool {
+        bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    }
+}
+
 // MARK: - Glyph drawing
 
-/// History glyphs (design 1d/2d) — drawn once; label-color based so they
-/// follow light/dark at creation time (v0: "do not invest", SPEC §5).
+/// History glyphs (design 1d/2d). Drawn through
+/// `NSImage(size:flipped:drawingHandler:)` so the handler re-runs (and
+/// `labelColor` re-resolves) whenever the glyph is drawn in a new
+/// appearance — a `lockFocus` bitmap would bake in light or dark.
 private enum HistoryGlyphs {
 
     /// Static action-item checkbox (design 1d): 13 pt square, radius 4,
     /// 1.5 pt border black 25% — a GLYPH, never interactive (SPEC §5: v0
     /// stores no done-ness; this surface must not become a todo widget).
+    ///
+    /// The accessibility description is phrased as STATE, not as a control
+    /// (UX review finding 19): VoiceOver reading "checkbox, unchecked" would
+    /// promise a toggle that does not exist here. The glyph rides inline as an
+    /// `NSTextAttachment` before each action item, so the row reads
+    /// "Action item, not tracked — Send annual-prepay quote to Dan".
     static let checkbox: NSImage = {
-        let image = NSImage(size: NSSize(width: 13, height: 13))
-        image.lockFocus()
-        NSColor.labelColor.withAlphaComponent(0.35).setStroke()
-        let path = NSBezierPath(
-            roundedRect: NSRect(x: 0.75, y: 0.75, width: 11.5, height: 11.5),
-            xRadius: 4,
-            yRadius: 4
-        )
-        path.lineWidth = 1.5
-        path.stroke()
-        image.unlockFocus()
+        let image = NSImage(size: NSSize(width: 13, height: 13), flipped: false) { _ in
+            NSColor.labelColor.withAlphaComponent(0.35).setStroke()
+            let path = NSBezierPath(
+                roundedRect: NSRect(x: 0.75, y: 0.75, width: 11.5, height: 11.5),
+                xRadius: 4,
+                yRadius: 4
+            )
+            path.lineWidth = 1.5
+            path.stroke()
+            return true
+        }
+        image.accessibilityDescription = "Action item, not tracked"
+        return image
+    }()
+
+    /// Validator warning triangle (design 1d: `exclamationmark.triangle`,
+    /// 13×12, #E6A700 with a knocked-out white mark). Appearance-independent
+    /// on purpose — it sits on the card's yellow fill in both modes.
+    static let validatorWarning: NSImage = {
+        let image = NSImage(size: NSSize(width: 13, height: 12), flipped: true) { _ in
+            let triangle = NSBezierPath()
+            triangle.move(to: NSPoint(x: 6.5, y: 1))
+            triangle.line(to: NSPoint(x: 12, y: 11))
+            triangle.line(to: NSPoint(x: 1, y: 11))
+            triangle.close()
+            NSColor(srgbRed: 0xE6 / 255, green: 0xA7 / 255, blue: 0, alpha: 1).setFill()
+            triangle.fill()
+            NSColor.white.setFill()
+            NSBezierPath(
+                roundedRect: NSRect(x: 5.9, y: 4.4, width: 1.2, height: 3.2), xRadius: 0.6, yRadius: 0.6
+            ).fill()
+            NSBezierPath(ovalIn: NSRect(x: 5.75, y: 8.25, width: 1.5, height: 1.5)).fill()
+            return true
+        }
+        image.accessibilityDescription = "Warning"
         return image
     }()
 
     /// Gray waveform for the empty state (design 2d): 26×22, four rounded
     /// bars, black 18%.
-    static let emptyWaveform: NSImage = {
-        let size = NSSize(width: 26, height: 22)
-        let image = NSImage(size: size)
-        image.lockFocus()
+    static let emptyWaveform = NSImage(size: NSSize(width: 26, height: 22), flipped: false) { rect in
         NSColor.labelColor.withAlphaComponent(0.22).setFill()
         let barWidth: CGFloat = 3
         let gap: CGFloat = 3
         let heights: [CGFloat] = [6, 16, 10, 4]
-        let originX = (size.width - (CGFloat(heights.count) * barWidth + CGFloat(heights.count - 1) * gap)) / 2
+        let originX = (rect.width - (CGFloat(heights.count) * barWidth + CGFloat(heights.count - 1) * gap)) / 2
         for (index, height) in heights.enumerated() {
             let bar = NSRect(
                 x: originX + CGFloat(index) * (barWidth + gap),
-                y: (size.height - height) / 2,
+                y: (rect.height - height) / 2,
                 width: barWidth,
                 height: height
             )
             NSBezierPath(roundedRect: bar, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
         }
-        image.unlockFocus()
-        return image
-    }()
+        return true
+    }
 }
+
