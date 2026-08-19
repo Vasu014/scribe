@@ -154,8 +154,33 @@ and notes are already saved, so a retry costs nothing but the API call.
 ```bash
 make build            # xcodegen + xcodebuild, unsigned (CI parity)
 make test             # MeetingKitCore package tests
+make test-app         # App-layer unit tests
 scripts/dev.sh        # all of the above in one shot
 ```
+
+Coding agents: `.agents/setup.sh` runs the same steps plus a toolchain
+preflight (Xcode selection, Apple Silicon, `xcodegen`) with exact fix commands,
+guards the Sparkle pin in `Package.resolved`, and ends with a summary of what is
+verified. `--check` for preflight only; `--derived-data <path>` for an isolated
+build when several agents work in parallel.
+
+### App-layer tests
+
+`Tests/ScribeAppTests` covers the pure logic behind the UI — Whisper model
+folder resolution, the notes markdown renderer, elapsed-time formatting in
+both digits and speech, the menu bar's derived states, History's row
+derivation, the scratchpad's TextKit stack and the main menu's key
+equivalents. Underneath `make test-app` it is:
+
+```bash
+xcodebuild test -project Scribe.xcodeproj -scheme Scribe -destination 'platform=macOS'
+```
+
+The target compiles `App/` sources straight into the test bundle instead of
+hosting the app, so the suite runs headless: no window server, no TCC
+prompts, no status item. That is also its boundary — anything needing a live
+session (the status item's artwork, panel focus, TCC flows, Sparkle) is not
+covered here and still has to be driven by hand.
 
 ### Screenshot harness
 
