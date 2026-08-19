@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Persistence
 
 // MARK: - Engine gating
@@ -109,7 +110,8 @@ struct SegmentIdCache {
 /// instead of WhisperKit's built-in VAD because we hand it pre-windowed
 /// buffers). Constants are documented and tunable (dogfood, SPEC §7):
 /// - Frame: 30 ms (480 samples @ 16 kHz) RMS decision.
-/// - Speech frame: RMS ≥ `speechThresholdRMS` (0.02 ≈ −34 dBFS).
+/// - Speech frame: RMS ≥ `speechThresholdRMS` (0.005 ≈ −46 dBFS; system
+///   audio runs far quieter than close-mic speech — see the initializer).
 /// - Window OPENS at the first speech frame; windows with ≥
 ///   `minSpeechSeconds` (1 s) of speech qualify for inference — shorter
 ///   bursts are dropped (coughs, clicks).
@@ -143,6 +145,16 @@ actor ChannelWorker {
     private var pending: [Float] = []
     private var pendingStartOffset: TimeInterval = 0
     private var pendingAnchored = false
+
+    // DIAGNOSTICS (T10 dogfood): a session that captures nothing is
+    // indistinguishable from a broken mic, a too-high speech threshold and a
+    // dead capture path — all three surface only as "No transcript segments
+    // were persisted" minutes later. These counters make the difference
+    // visible in one log line at stop.
+    private var chunksSeen = 0
+    private var samplesSeen = 0
+    private var peakRMS: Float = 0
+    private var windowsOpened = 0
     private var window: [Float] = []
     private var windowStartOffset: TimeInterval = 0
     private var windowOpen = false
@@ -160,9 +172,34 @@ actor ChannelWorker {
         engine: any WhisperEngine,
         sampleRate: Double = 16_000,
         frameMilliseconds: Int = 30,
-        speechThresholdRMS: Float = 0.02,
-        minSpeechSeconds: Double = 1.0,
-        hangoverSeconds: Double = 0.8,
+        // 0.02 (≈ −34 dBFS) was tuned against close-mic speech and is far too
+        // high for SYSTEM audio: a real 52 s live stream peaked at 0.0101, so
+        // not one frame in the whole session qualified as speech and the
+        // transcript came out empty with no error anywhere. 0.005 (≈ −46 dBFS)
+        // clears observed system-audio levels while staying above room tone.
+        // Override per-run with `defaults write io.github.vasu014.scribe
+        // speechThresholdRMS -float 0.003` (T10 dogfood tuning).
+        speechThresholdRMS: Float = {
+            let override = UserDefaults.standard.float(forKey: "speechThresholdRMS")
+            return override > 0 ? override : 0.005
+        }(),
+        // Dogfood tuning (T10): with these at 1.0 / 0.8, a real 45 s stream
+        // opened 17 windows and emitted only 2 — 15 were binned. Ordinary
+        // speech is short phrases separated by pauses, so a window closes on
+        // a 0.8 s pause BEFORE accumulating 1 s of speech and is discarded as
+        // a "cough". Only two long unbroken sentences survived, which is why
+        // the transcript began at 00:28 with everything before it lost.
+        // 1.2 s hangover lets a natural pause stay inside one window; 0.4 s
+        // minimum still rejects clicks. Both overridable via
+        // `defaults write io.github.vasu014.scribe minSpeechSeconds -float X`.
+        minSpeechSeconds: Double = {
+            let o = UserDefaults.standard.double(forKey: "minSpeechSeconds")
+            return o > 0 ? o : 0.4
+        }(),
+        hangoverSeconds: Double = {
+            let o = UserDefaults.standard.double(forKey: "hangoverSeconds")
+            return o > 0 ? o : 1.2
+        }(),
         maxWindowSeconds: Double = 30.0,
         emit: @escaping @Sendable (TranscriptSegment) -> Void
     ) {
@@ -207,6 +244,8 @@ actor ChannelWorker {
         }
         nextExpectedOffset = chunk.sessionOffset + Double(chunk.samples.count) / sampleRate
 
+        chunksSeen += 1
+        samplesSeen += chunk.samples.count
         pending.append(contentsOf: chunk.samples)
         processFrames()
         await closeIfExpired()
@@ -218,6 +257,18 @@ actor ChannelWorker {
     /// `minSpeechSeconds` still emits here — better a short final segment
     /// than silently dropped audio at session end.
     func finish() async {
+        // One line that distinguishes "mic delivered nothing" from "audio
+        // arrived but never crossed the speech threshold" from "windows
+        // opened fine" — see the counters' declaration.
+        Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").info("""
+        Capture summary [\(String(describing: self.channel), privacy: .public)]: \
+        chunks=\(self.chunksSeen, privacy: .public) \
+        samples=\(self.samplesSeen, privacy: .public) \
+        (\(String(format: "%.1f", Double(self.samplesSeen) / self.sampleRate), privacy: .public)s) \
+        peakRMS=\(String(format: "%.4f", self.peakRMS), privacy: .public) \
+        threshold=\(String(format: "%.4f", self.speechThresholdRMS), privacy: .public) \
+        windowsOpened=\(self.windowsOpened, privacy: .public)
+        """)
         if windowOpen {
             await closeWindow(forced: true)
         }
@@ -233,7 +284,9 @@ actor ChannelWorker {
     private func processFrames() {
         while pending.count >= frameSamples {
             let frame = pending.prefix(frameSamples)
-            let isSpeech = Self.rms(frame) >= speechThresholdRMS
+            let frameRMS = Self.rms(frame)
+            peakRMS = max(peakRMS, frameRMS)
+            let isSpeech = frameRMS >= speechThresholdRMS
             pending.removeFirst(frameSamples)
             pendingStartOffset += Double(frameSamples) / sampleRate
 
@@ -244,6 +297,7 @@ actor ChannelWorker {
                 windowStartOffset = pendingStartOffset - Double(frameSamples) / sampleRate
                 window = Array(frame)
                 windowOpen = true
+                windowsOpened += 1
                 trailingSilenceSamples = 0
                 speechEndIndex = window.count
                 speechSampleCount = frameSamples
@@ -281,7 +335,16 @@ actor ChannelWorker {
 
         let speechBuffer = Array(window.prefix(max(0, speechEndIndex)))
         let qualifies = forced || speechSampleCount >= minSpeechSamples
-        guard qualifies, !speechBuffer.isEmpty else { return }
+        guard qualifies, !speechBuffer.isEmpty else {
+            if !speechBuffer.isEmpty {
+                Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").info("""
+                Window DISCARDED [\(String(describing: self.channel), privacy: .public)] \
+                \(String(format: "%.2f", Double(self.speechSampleCount) / self.sampleRate), privacy: .public)s speech \
+                < \(String(format: "%.2f", Double(self.minSpeechSamples) / self.sampleRate), privacy: .public)s minimum
+                """)
+            }
+            return
+        }
 
         await decodeAndEmit(samples: speechBuffer, windowStart: windowStartOffset)
     }
@@ -303,9 +366,23 @@ actor ChannelWorker {
         } catch {
             // v0: drop the window (nothing consumes the transcript live,
             // SPEC §4.2). Phase 2 adds bounded retry / re-decode handling.
+            // LOG IT: a swallowed decode error is indistinguishable from
+            // "nobody spoke" — it surfaces minutes later as an empty
+            // transcript and a fusion failure, with no clue why.
+            Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").error("""
+            Decode FAILED [\(String(describing: self.channel), privacy: .public)] \
+            \(String(format: "%.1f", Double(samples.count) / self.sampleRate), privacy: .public)s window: \
+            \(String(describing: error), privacy: .public)
+            """)
             return
         }
-        guard !hypotheses.isEmpty else { return }
+        guard !hypotheses.isEmpty else {
+            Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").error("""
+            Decode returned NO hypotheses [\(String(describing: self.channel), privacy: .public)] \
+            for a \(String(format: "%.1f", Double(samples.count) / self.sampleRate), privacy: .public)s window.
+            """)
+            return
+        }
 
         // Single chokepoint for special-token stripping (SPEC §4.2): this is
         // the ONE place a `TranscriptSegment`'s text is produced from engine
@@ -321,7 +398,18 @@ actor ChannelWorker {
             .map { WhisperSpecialTokens.strip($0.text) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else {
+            Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").error("""
+            Decode produced EMPTY text [\(String(describing: self.channel), privacy: .public)] \
+            from \(hypotheses.count, privacy: .public) hypothes(es) — all stripped to nothing.
+            """)
+            return
+        }
+        Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").info("""
+        Segment emitted [\(String(describing: self.channel), privacy: .public)] \
+        @\(String(format: "%.1f", windowStart), privacy: .public)s: \
+        \(text.count, privacy: .public) chars
+        """)
 
         // Offsets (SPEC §4.2): chunk sessionOffset + window position within
         // the accumulated buffer. Hypothesis seconds are relative to the
