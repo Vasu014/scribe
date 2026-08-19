@@ -164,7 +164,19 @@ public final class SessionCoordinator: @unchecked Sendable {
         captureEngine: any CaptureEngine,
         transcriber: any Transcriber,
         lookback: TimeInterval = 20,
-        transcriptDrainTimeout: TimeInterval = 10,
+        // 10 s was tuned against `small.en` (480 MB). A larger model — the
+        // 890 MB Hinglish fine-tune, or large-v3 — takes materially longer to
+        // load AND to decode a 30 s window, so 10 s cut inference off before a
+        // single segment was persisted and the meeting came back empty. This
+        // budget only bounds a transcriber that has STOPPED making progress
+        // (the failure it was added for), so it can afford to be generous:
+        // stopping a healthy session still returns as soon as the drain ends.
+        // Overridable with `defaults write io.github.vasu014.scribe
+        // transcriptDrainTimeout -float N`.
+        transcriptDrainTimeout: TimeInterval = {
+            let override = UserDefaults.standard.double(forKey: "transcriptDrainTimeout")
+            return override > 0 ? override : 90
+        }(),
         fusionRunner: @escaping FusionRunner
     ) {
         self.store = store
