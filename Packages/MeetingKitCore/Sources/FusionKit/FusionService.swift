@@ -113,7 +113,7 @@ public final class FusionService: Sendable {
         } catch {
             // SPEC §4.5: fusion errors leave the session in `processing`
             // with Retry; nothing is stored.
-            return .failure(.provider(String(describing: error)))
+            return .failure(.provider(Self.describe(error)))
         }
 
         // Parse + validate (deterministic, no model calls, SPEC §4.5).
@@ -150,6 +150,21 @@ public final class FusionService: Sendable {
             return .success(noteId: note.id, title: title)
         }
         return .storedWithFindings(noteId: note.id, title: title, findings: findings)
+    }
+
+    /// Message carried to the Retry UI (SessionCoordinator passes
+    /// `FusionServiceError.provider`'s payload through verbatim).
+    ///
+    /// `String(describing:)` on a provider error renders the enum case —
+    /// `httpStatus(401, "{\"type\":\"error\"…")` — which reads identically
+    /// whether the user's API key is wrong or Anthropic is down. Providers
+    /// that conform to `LocalizedError` get to say which; anything else falls
+    /// back to the structural dump so no diagnostic detail is lost.
+    static func describe(_ error: Error) -> String {
+        if let localized = error as? LocalizedError, let description = localized.errorDescription {
+            return description
+        }
+        return String(describing: error)
     }
 
     // MARK: Provider calls

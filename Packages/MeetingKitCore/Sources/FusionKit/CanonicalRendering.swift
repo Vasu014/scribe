@@ -124,18 +124,39 @@ public enum CanonicalRendering {
             .joined(separator: " ")
     }
 
-    /// Normalized text of segments overlapping `[offset − window, offset + window]`.
+    /// Normalized text of segments overlapping `[offset − window, offset + window]`,
+    /// **one haystack per channel**, each in time order.
+    ///
     /// Quotes may span segment boundaries — matching runs against this
     /// text-only rendering (timestamp/channel tokens stripped), never against
-    /// the raw rendering.
-    public static func normalizedTextWindow(
+    /// the raw rendering (SPEC §4.5).
+    ///
+    /// PER-CHANNEL IS LOAD-BEARING, do not "simplify" back to one interleaved
+    /// string. Two-channel capture means the other speaker's segments are
+    /// routinely time-interleaved with this speaker's: a single backchannel
+    /// ("mm hmm") landing between two of the quoted speaker's segments used to
+    /// splice itself into the middle of an otherwise verbatim quote and
+    /// produce a false `quoteMismatch` — the validator crying wolf on the
+    /// normal case. Nobody utters a quote that spans two speakers, so
+    /// splitting by channel removes those false positives without weakening
+    /// the check (it also stops a quote from "matching" a span it never had,
+    /// which the interleaved haystack could invent).
+    ///
+    /// Channel order in the returned array is fixed (`local` then `remote`)
+    /// so validator output is deterministic.
+    public static func normalizedTextWindows(
         _ segments: [SegmentRecord],
         around offset: TimeInterval,
         window: TimeInterval
-    ) -> String {
+    ) -> [String] {
         let overlapping = segments
             .filter { $0.endOffset >= offset - window && $0.startOffset <= offset + window }
             .sorted { $0.startOffset < $1.startOffset }
-        return normalize(overlapping.map(\.text).joined(separator: " "))
+        return [Channel.local, Channel.remote].compactMap { channel in
+            let texts = overlapping.filter { $0.channel == channel }.map(\.text)
+            guard !texts.isEmpty else { return nil }
+            let normalized = normalize(texts.joined(separator: " "))
+            return normalized.isEmpty ? nil : normalized
+        }
     }
 }
