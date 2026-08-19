@@ -168,7 +168,7 @@ struct TranscriptSegment {
 
 **Responsibility:** Turn (transcript + fragments) into structured notes + a session title.
 
-- **Provider:** Frontier model via direct API (Claude Sonnet-class; decided). Per-user API key in Keychain, entered in Settings. Behind a `FusionProvider` protocol — relocates server-side in Phase 2 unchanged upstream. **Temperature 0–0.3** (grounding task, not creative; also keeps the both-sides test meaningful).
+- **Provider:** Frontier model via direct API (Claude Sonnet-class; decided). Per-user API key in Keychain, entered in Settings. Behind a `FusionProvider` protocol — relocates server-side in Phase 2 unchanged upstream. **Temperature 0–0.3 where the model accepts sampling parameters; otherwise omit them.** (Amended 2026-08-19: the current Claude 5-class models — Sonnet 5, Opus 5, Fable 5 — removed `temperature`/`top_p`/`top_k` and return HTTP 400 if they are sent, so the original unconditional "Temperature 0–0.3" is unimplementable on the model this ships with. The grounding intent is unchanged and is now carried by the system prompt's citation rules plus the deterministic validator; the `FusionProvider.complete(…temperature:)` seam still passes the value for a provider that does accept it, e.g. a pinned older model.)
 
 #### Canonical rendering (three-way contract)
 

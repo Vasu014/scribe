@@ -31,6 +31,39 @@ Legend: □ todo · ◐ in flight · ✔ done · — blocked/not started
 | T9 | Release engineering | all | ✔ | Sparkle 2 SPM + appcast template, notarytool script (env-gated; team ID placeholder), hardened-runtime check, root README (build/test/layout). |
 | T10 | Dogfood hardening | T4 | ◐ | Harness landed (S1): `Tools/SpikeHarness` + `scripts/spike1-run.sh`; **smoke matrix 4/4 OK on macOS 26.3** (90 s runs, both channels continuous, no degradation). Remaining: full 600 s matrix on both machines (+ AirPods pass), pin outcome in `SCKCaptureEngine`, sleep/permission-revocation passes, then dogfood toward the Phase 0 exit gate (SPEC §2). |
 
+## Wave 4 — UI polish & interaction hardening (2026-08-19 dogfood round)
+
+Triggered by the first real dogfood: the UI had been verified from screenshots, not by driving it,
+so the interaction layer shipped broken. `.agents/ux-accessibility-review.md` (27 findings: 8
+blockers, 10 major, 9 minor) and `.agents/design-spec.md` (919-line acceptance checklist extracted
+from the canvas, incl. new §3a/§3b/§4a) are the work lists.
+
+| # | Task | Status | Summary |
+|---|------|--------|---------|
+| T11 | Visual polish vs design | ✔ | Screenshot harness (`App/UIGallery.swift` + `scripts/ui-gallery.sh`, 10 scenes). Settings grouped cards, History validator card + markdown paragraph joining, scratchpad 312 pt + stretchable corner mask, wizard alignment/footer, menu-bar glyph geometry. Full dark-mode pass (hardcoded `black.withAlphaComponent` → dynamic system colors). |
+| T12 | Stop / frozen elapsed | ✔ | Root cause: `LazyWhisperKitTranscriber` never called `continuation.finish()` on the model-LOADED path, so the drain awaited forever and `stop()` hung before writing `processing`. Masked until `path(percentEncoded:)` made WhisperKit actually load. Drain now bounded (`transcriptDrainTimeout`), state written before draining, regression test added. |
+| T13 | Keyboard & reachability | ✔ | Main menu (App/Edit/Window — ⌘W ⌘Q ⌘, and **⌘V**, which had made API-key paste impossible); quit-while-recording confirm; panel key focus + `acceptsFirstMouse`; panel-scoped Esc hotkey; single-instance guard; History keyboard nav (⌘1/⌘2, ⌘⌫, ⌘E, ⌘R, ⇧⌘E, initial responder, focus rings); wizard Esc; ⌘. = Stop. |
+| T14 | Accessibility | ✔ | Per-state VoiceOver labels on the status item (recording state was inaudible — the consent claim did not hold for blind users); labels across panel/History/Settings/wizard; contrast lifted to WCAG AA (HUD muted text → white 60%); Increase Contrast + live Reduce Motion observers. Text size accepted as a documented v0 limitation (AppKit has no Dynamic Type). |
+| T15 | Fullscreen recording chip (§4a) | ◐ | Design 4a: non-activating top-right chip, shown only while capturing AND the status item is off-screen; pulsing dot + elapsed, Stop on hover, drag along top edge, 4 s → 60% idle fade. Closes the §3b consent invariant that broke in fullscreen. Includes approved deviations D1/D2 (see design-spec "Approved deviations"). |
+| T16 | Meeting auto-detection | □ | ROADMAP (owner: "part of roadmap later"). Calendar-triggered pre-meeting prompt + microphone-in-use detection for unscheduled calls, so the user never clicks Start blind. Removes the failure mode D2 currently compensates for. |
+| T17 | Correctness audit fixes | ◐ | From `.agents/audit-{app-layer,capture-core,data-fusion}.md` (49 findings: 3 critical, 20 major). Landed: session-scoped pipeline (a stalled drain no longer zeroes the NEXT session's segments), `drivesDisplay` resolved at apply time in BOTH `stop()` and `retryFusion`, fusion in-flight guard, validator rebuilt (scanned citations + required-citation check + per-channel matching), `claude-sonnet-5` + temperature omitted, bad-key vs outage distinguishable, deleted scratchpad text no longer reaches fusion, History fusing-timer lifecycle, store-failure alert replacing the silent in-memory fallback, capture-degradation banner, Esc global grab removed. |
+
+### Follow-ups surfaced by T17 (API gaps agents correctly refused to fake)
+
+| # | Task | Status | Why it matters |
+|---|------|--------|----------------|
+| T18 | `CaptureEngine.pause()`/`resume()` — clock-preserving | □ | SPEC §4.4 requires sleep/wake to pause and resume capture. Today only device events are logged and the mic can stay dead for the rest of a meeting after wake. Calling `start()` again is NOT a resume: `SCKCaptureEngine.start()` re-creates the `MachSessionClock`, so every later buffer would be re-stamped from zero and every fragment anchor would be wrong. Needs a real pause/resume (or `rebuildGraph()`) plus a per-channel liveness signal, so the app-side `CaptureLivenessMonitor` decorator can be retired. |
+| T19 | `CoordinatorEvent.captureDegraded` + surface notice API | □ | System-audio degradation is currently surfaced by an app-owned floating banner because `MenuBarController` / `ScratchpadPanelController` / `RecordingChipController` expose no notice entry point (`showWarning(title:detail:)` or a `notice` property → status-item ⚠ + menu row + panel header line), and SessionKit has no degradation event. Without the event, History and `device_events` cannot record that a meeting captured mic-only. |
+| T20 | `MeetingStore.deleteFragment` | □ | Discarding a pending scratchpad burst blanks the row but cannot remove it, so an empty tombstone survives and still counts toward History's "fused from N fragments". Needs a real delete wired through `onDiscardPending`. |
+| T21 | Extend the suite to the defect classes it missed | □ | 82 tests passed while the app's core action was dead. Audits found findings #1–#6 (capture) entirely uncovered. Wanted: session-boundary races, abnormal-termination paths, stream-continuation completion on every branch, and the silent-degradation paths. Suite is at 118 after T17. |
+
+### Verification standard (changed this round)
+Screenshots are NOT verification for interaction. Every fix must be demonstrated by driving the real
+app — synthetic events through a live AppKit event pump, in-process AX-tree readback, or store
+assertions. Where the environment blocks it (e.g. a locked screen prevents real hover/click/key-window
+behavior), that must be reported explicitly as "unverified — requires unlocked screen" rather than
+implied to be tested.
+
 ## Notes for every task
 - SPEC.md section citations in code comments where behavior is specced.
 - `swift test` green in Packages/MeetingKitCore before reporting done; App work: `make build` green.
