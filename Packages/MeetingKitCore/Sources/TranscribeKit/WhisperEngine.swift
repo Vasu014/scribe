@@ -154,7 +154,9 @@ public actor WhisperKitEngine: WhisperEngine {
             computeOptions: compute,
             verbose: false,
             logLevel: .none,
-            prewarm: false,
+            // WhisperKit performs these stages in order during init. Keeping
+            // both explicit avoids a first-decode Core ML compile/load race.
+            prewarm: true,
             load: true,
             // Never download implicitly: network fetches happen only through
             // ModelDownloadManager (first-launch setup flow, SPEC §4.2), and a

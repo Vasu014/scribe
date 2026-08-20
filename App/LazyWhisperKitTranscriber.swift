@@ -1,13 +1,11 @@
-import AppKit
 import Foundation
 import TranscribeKit
 import os
 
 /// Production `Transcriber` wiring (T8): ONE shared `WhisperKitEngine` model
 /// instance (SPEC §4.2 shared-model rule — two model instances ≈ 1 GB RAM +
-/// GPU contention are explicitly rejected), built LAZILY at the first
-/// session start. Model load takes seconds; building at launch would delay
-/// the menu bar for a download nobody asked for yet.
+/// GPU contention are explicitly rejected), prepared before capture starts.
+/// Launch preparation is best-effort and Start awaits the same single-flight.
 ///
 /// ## Why a fresh `WhisperKitTranscriber` per STREAM
 /// `WhisperKitTranscriber` caches one `ChannelWorker` per channel for its
@@ -50,39 +48,31 @@ import os
 /// (Settings → Whisper Model) applies at the next session start (SPEC §4.2),
 /// never mid-session — a live stream keeps the engine it resolved.
 ///
-/// ## Missing model fallback
-/// If the model folder is missing at session start (download skipped or
-/// deleted, or the user picked a variant they have not downloaded), the
-/// session falls back to `UnimplementedTranscriber`: meetings still record,
-/// fragments still persist, and fusion reports the empty transcript with a
-/// clear error. This is NOT silent any more — it was, and it cost a whole
-/// meeting with nothing on screen: `onModelUnavailable` fires, and with
-/// nothing wired the user gets a warning naming the variant and a route to
-/// Settings, where the model can be downloaded. Resolution is retried at the
-/// next session start in case the model appeared meanwhile.
+/// ## Missing model
+/// A missing or unloadable model fails preparation before capture. It never
+/// creates a recording row and never asks WhisperKit to download implicitly.
 final class LazyWhisperKitTranscriber: Transcriber, @unchecked Sendable {
 
-    /// Composition-root hook (`ScribeApp`): called on the main actor when a
-    /// session starts and no usable model can be resolved, with the variant
-    /// name. Wire it to own the presentation (a menu-bar notice, the setup
-    /// wizard, …); when nothing is wired, `presentMissingModelNotice`
-    /// warns and offers Settings, because "record an hour, transcribe
-    /// nothing, log it" is not an acceptable default.
-    @MainActor
-    static var onModelUnavailable: ((String) -> Void)?
+    struct PreparationError: LocalizedError, Equatable {
+        let variant: String
 
-    /// Whether the persisted variant is present on disk — the cheap check a
-    /// start-flow guard can run BEFORE a meeting begins (the TCC guards in
-    /// `MenuBarController`/`ScratchpadPanelController`/`HistoryWindowController`
-    /// are the model to follow). `false` means this launch would record a
-    /// meeting with no transcript.
-    static var selectedModelIsDownloaded: Bool {
-        ModelDownloadManager().isDownloaded(SettingsKeys.whisperModelName)
+        var errorDescription: String? {
+            "Speech model “\(variant)” isn’t ready. Open Settings → Whisper Model, download it, then try again."
+        }
     }
 
     /// All mutable state lives in this actor; `transcribe` is a thin,
     /// lock-free entry that awaits it.
     private let resolver = Resolver()
+
+    func prepare() async throws {
+        _ = try await resolver.prepareSelectedModel()
+    }
+
+    func prepareForSession() async throws -> any Transcriber {
+        let prepared = try await resolver.prepareSelectedModel()
+        return PreparedWhisperKitTranscriber(prepared: prepared)
+    }
 
     func transcribe(stream: AsyncStream<AudioChunk>) -> AsyncStream<TranscriptSegment> {
         AsyncStream { continuation in
@@ -115,50 +105,6 @@ final class LazyWhisperKitTranscriber: Transcriber, @unchecked Sendable {
         }
     }
 
-    // MARK: - Missing-model notice
-
-    /// Default presentation for `onModelUnavailable`. Modal by intent: the
-    /// user is starting a meeting that will produce no transcript, and every
-    /// other signal this failure had (an OSLog line) has already proved
-    /// invisible. All the app's timers run in `.common` run-loop modes, so
-    /// the recording UI keeps ticking behind the alert, and capture itself
-    /// runs off the main thread.
-    @MainActor
-    fileprivate static func presentMissingModelNotice(variant: String) {
-        if let hook = onModelUnavailable {
-            hook(variant)
-            return
-        }
-        // Both channels can fail their resolution at once, and a stream that
-        // unwinds late can fail again; one warning per occasion is enough.
-        guard !noticeIsVisible else { return }
-        noticeIsVisible = true
-        defer { noticeIsVisible = false }
-
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "This meeting won’t be transcribed"
-        alert.informativeText = """
-        The speech model “\(variant)” isn’t downloaded, so Scribe is recording your \
-        notes but cannot produce a transcript of what is said.
-
-        Open Settings → Whisper Model to download it. Transcription resumes at the \
-        next meeting.
-        """
-        alert.addButton(withTitle: "Open Settings…")
-        alert.addButton(withTitle: "Continue Without Transcription")
-        // Accessory app (LSUIElement): without this the alert opens behind
-        // whatever the user is actually looking at.
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            SettingsWindowController.current?.show()
-        }
-    }
-
-    /// Guards against stacking one alert per channel stream.
-    @MainActor
-    private static var noticeIsVisible = false
-
     #if DEBUG
     /// TEST SEAM (dev tooling; sibling of
     /// `WhisperKitTranscriber.reviseForTesting`): replaces model resolution,
@@ -166,6 +112,11 @@ final class LazyWhisperKitTranscriber: Transcriber, @unchecked Sendable {
     /// timed-out drain, a back-to-back restart — without a 500 MB Core ML
     /// load and without speech audio. Never set on any app path.
     nonisolated(unsafe) static var engineFactoryForTesting: (@Sendable (String) async -> (any WhisperEngine)?)?
+    enum EngineBuildAccess: Hashable, Sendable { case started, joined }
+    /// Fires from the resolver actor only after a keyed build has actually
+    /// been registered or joined (not merely when preparation is requested).
+    nonisolated(unsafe) static var onEngineBuildAccessForTesting:
+        (@Sendable (String, EngineBuildAccess) -> Void)?
     #endif
 }
 
@@ -242,84 +193,101 @@ private actor Resolver {
 
     private static let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber")
 
-    // Model cache — one engine per app lifetime, keyed by variant.
-    private var engineVariant: String?
-    private var engine: (any WhisperEngine)?
-    private var engineBuild: Task<(variant: String, engine: any WhisperEngine)?, Never>?
-    private var engineBuildVariant: String?
-    /// Identifies a build across suspensions: a build superseded by a variant
-    /// change must not adopt the cache when it finally lands.
-    private var engineBuildToken = 0
+    struct PreparedEngine: Sendable {
+        let variant: String
+        let engine: any WhisperEngine
+    }
+
+    private struct EngineBuild {
+        let id: Int
+        let task: Task<PreparedEngine?, Never>
+    }
+
+    // Only one completed engine is retained to respect SPEC §4.2's memory
+    // budget. In-flight work is keyed independently so A → B → A rejoins A.
+    private var cachedEngine: PreparedEngine?
+    private var preparedEngine: PreparedEngine?
+    private var engineBuilds: [String: EngineBuild] = [:]
+    private var nextEngineBuildID = 0
+
+    func prepareSelectedModel() async throws -> PreparedEngine {
+        let variant = SettingsKeys.whisperModelName
+        guard let prepared = await resolveEngine(variant: variant) else {
+            throw LazyWhisperKitTranscriber.PreparationError(variant: variant)
+        }
+        // This cache is explicitly tagged. A late background A may replace
+        // the warm cache after Start bound B, but can neither alter B's
+        // returned handle nor be consumed as B by a later direct caller.
+        preparedEngine = prepared
+        return prepared
+    }
 
     /// A transcriber for ONE stream, over the shared model. `nil` when no
-    /// model is available — the caller drains through
-    /// `UnimplementedTranscriber` and the user has already been warned.
+    /// model is available — the defensive direct-call path drains through
+    /// `UnimplementedTranscriber`; SessionCoordinator never reaches it.
     func makeStreamTranscriber() async -> (any Transcriber)? {
         let variant = SettingsKeys.whisperModelName
-        guard let engine = await resolveEngine(variant: variant) else { return nil }
-        return WhisperKitTranscriber(engine: engine)
+        if let preparedEngine, preparedEngine.variant == variant {
+            return WhisperKitTranscriber(engine: preparedEngine.engine)
+        }
+        // Defensive compatibility for direct callers that have not adopted
+        // the preparation seam. SessionCoordinator always prepares first.
+        guard let prepared = try? await prepareSelectedModel() else { return nil }
+        return WhisperKitTranscriber(engine: prepared.engine)
     }
 
     // MARK: Model resolution
 
-    private func resolveEngine(variant: String) async -> (any WhisperEngine)? {
+    private func resolveEngine(variant: String) async -> PreparedEngine? {
         // Fast path: cached engine matches the persisted variant.
-        if engineVariant == variant, let engine {
-            return engine
-        }
-        // A build for this variant is already in flight (the sibling
-        // channel's call, or a still-unwinding stream from a previous
-        // session) — never load the model twice, and share its FAILURE too:
-        // retrying inside the same session would just stall the second
-        // channel behind a second doomed load. The retry is the next session
-        // start (class docs).
-        if let engineBuild, engineBuildVariant == variant {
-            return (await engineBuild.value)?.engine
+        if cachedEngine?.variant == variant {
+            return cachedEngine
         }
 
-        engineBuildToken += 1
-        let token = engineBuildToken
-        let build = Task { await Self.buildEngine(variant: variant) }
-        engineBuild = build
-        engineBuildVariant = variant
-        let outcome = await build.value
-        // Only the build that is still current adopts the app-lifetime
-        // cache. If the variant changed while this load was in flight, a
-        // newer engine is already cached and this (older) result must not
-        // clobber it — it is handed to its own caller and then dropped.
-        if engineBuildToken == token {
-            engineBuild = nil
-            engineBuildVariant = nil
-            if let outcome {
-                engineVariant = outcome.variant
-                engine = outcome.engine
-            } else {
-                // Exactly one warning per failed load: the sibling channel
-                // joined this build above and returns without re-reporting.
-                Task { @MainActor in
-                    LazyWhisperKitTranscriber.presentMissingModelNotice(variant: variant)
-                }
-            }
+        let build: EngineBuild
+        if let existing = engineBuilds[variant] {
+            build = existing
+            #if DEBUG
+            LazyWhisperKitTranscriber.onEngineBuildAccessForTesting?(variant, .joined)
+            #endif
+        } else {
+            nextEngineBuildID += 1
+            let id = nextEngineBuildID
+            let task = Task { await Self.buildEngine(variant: variant) }
+            build = EngineBuild(id: id, task: task)
+            engineBuilds[variant] = build
+            #if DEBUG
+            LazyWhisperKitTranscriber.onEngineBuildAccessForTesting?(variant, .started)
+            #endif
         }
-        return outcome?.engine
+
+        let outcome = await build.task.value
+        // Any waiter may resume first. Compare IDs so only this exact build
+        // clears the keyed slot; no lock is held across the await (actor
+        // isolation protects the dictionary).
+        if engineBuilds[variant]?.id == build.id {
+            engineBuilds[variant] = nil
+            if let outcome { cachedEngine = outcome }
+        }
+        return outcome
     }
 
     /// Nonisolated build (no actor state): locate the variant folder, then
     /// load, then wrap in the app-wide inference gate. Returns `nil` (with a
-    /// loud log) when the model is missing or failed to load — callers fall
-    /// back to `UnimplementedTranscriber` and the user is warned.
-    private static func buildEngine(variant: String) async -> (variant: String, engine: any WhisperEngine)? {
+    /// loud log) when the model is missing or failed to load; Start then
+    /// surfaces an actionable preparation error before capture.
+    private static func buildEngine(variant: String) async -> PreparedEngine? {
         #if DEBUG
         if let factory = LazyWhisperKitTranscriber.engineFactoryForTesting {
             guard let engine = await factory(variant) else { return nil }
-            return (variant, SharedInferenceGate(engine: engine))
+            return PreparedEngine(variant: variant, engine: SharedInferenceGate(engine: engine))
         }
         #endif
         guard let folder = WhisperModelLocator.locateModelFolder(variant: variant) else {
             logger.error("""
             Whisper model '\(variant, privacy: .public)' not found under the models root — \
-            transcription is disabled this session (Settings → Whisper Model downloads it). \
-            Retrying at the next session start.
+            preparation cannot complete (Settings → Whisper Model downloads it). \
+            Start will remain blocked until the model is available.
             """)
             return nil
         }
@@ -335,17 +303,43 @@ private actor Resolver {
                 modelFolder: WhisperModelLocator.modelFolderArgument(folder)
             )
             logger.info("WhisperKit engine loaded for '\(variant, privacy: .public)' in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)), privacy: .public)s.")
-            return (variant, SharedInferenceGate(engine: engine))
+            return PreparedEngine(variant: variant, engine: SharedInferenceGate(engine: engine))
         } catch {
             logger.error("""
             WhisperKit engine failed to load for '\(variant, privacy: .public)': \
-            \(String(describing: error), privacy: .public) — falling back to no \
-            transcription this session.
+            \(String(describing: error), privacy: .public) — Start will remain \
+            blocked until model preparation succeeds.
             """)
             return nil
         }
     }
 
+}
+
+/// Session-scoped handle returned to `SessionCoordinator.start()`. Both
+/// channel streams receive fresh workers over this exact tagged engine;
+/// resolver cache changes after Start cannot affect the active session.
+private final class PreparedWhisperKitTranscriber: Transcriber, @unchecked Sendable {
+    private let prepared: Resolver.PreparedEngine
+
+    init(prepared: Resolver.PreparedEngine) {
+        self.prepared = prepared
+    }
+
+    func transcribe(stream: AsyncStream<AudioChunk>) -> AsyncStream<TranscriptSegment> {
+        AsyncStream { continuation in
+            let task = Task { [prepared] in
+                // Retain the stream-scoped implementation until its output
+                // ends; WhisperKitTranscriber's consumer task is weak-self.
+                let impl = WhisperKitTranscriber(engine: prepared.engine)
+                for await segment in impl.transcribe(stream: stream) {
+                    continuation.yield(segment)
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 // MARK: - Model location

@@ -13,6 +13,9 @@ import Persistence
 /// states from them at display time. Never add UI-state columns to the schema.
 public enum SessionDisplayState: Equatable, Sendable {
     case idle
+    /// Core ML is being prewarmed/loaded. Capture has not started and no
+    /// recording row exists yet.
+    case preparing
     case recording
     /// Fusion in flight (storage `processing`, no canonical note yet).
     case processing

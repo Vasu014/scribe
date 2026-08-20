@@ -2,7 +2,7 @@ import CaptureKit
 import FusionKit
 import Persistence
 import ScratchpadKit
-import SessionKit
+@testable import SessionKit
 import TranscribeKit
 import XCTest
 
@@ -16,6 +16,7 @@ private final class MockTranscriber: Transcriber, @unchecked Sendable {
 
     private let lock = NSLock()
     private var chunkCountsStorage: [Channel: Int] = [:]
+    private var prepareCallsStorage = 0
     private let revisions: Int
 
     /// - Parameter revisions: hypotheses emitted per channel; all share one
@@ -27,6 +28,15 @@ private final class MockTranscriber: Transcriber, @unchecked Sendable {
     func chunkCount(for channel: Channel) -> Int {
         lock.lock(); defer { lock.unlock() }
         return chunkCountsStorage[channel] ?? 0
+    }
+
+    var prepareCalls: Int {
+        lock.lock(); defer { lock.unlock() }
+        return prepareCallsStorage
+    }
+
+    func prepare() async throws {
+        lock.lock(); prepareCallsStorage += 1; lock.unlock()
     }
 
     func transcribe(stream: AsyncStream<AudioChunk>) -> AsyncStream<TranscriptSegment> {
@@ -80,6 +90,103 @@ private final class MockTranscriber: Transcriber, @unchecked Sendable {
         }
         return segments
     }
+}
+
+private enum PreparationTestError: Error { case unavailable }
+
+private final class SuspendedPreparationTranscriber: Transcriber, @unchecked Sendable {
+    private let lock = NSLock()
+    private var callsStorage = 0
+    private var released = false
+    var failure: Error?
+
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return callsStorage }
+    func suspend() { lock.lock(); released = false; lock.unlock() }
+    func release() { lock.lock(); released = true; lock.unlock() }
+
+    func prepare() async throws {
+        lock.lock(); callsStorage += 1; lock.unlock()
+        while true {
+            lock.lock(); let ready = released; lock.unlock()
+            if ready { break }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        if let failure { throw failure }
+    }
+
+    func transcribe(stream: AsyncStream<AudioChunk>) -> AsyncStream<TranscriptSegment> {
+        UnimplementedTranscriber().transcribe(stream: stream)
+    }
+}
+
+private final class CountingCaptureEngine: CaptureEngine, @unchecked Sendable {
+    var onAudio: ((CapturedSample) -> Void)?
+    var remoteStreamActive = true
+    private let lock = NSLock()
+    private var startsStorage = 0
+    var starts: Int { lock.lock(); defer { lock.unlock() }; return startsStorage }
+    func start() async throws { lock.lock(); startsStorage += 1; lock.unlock() }
+    func stop() async {}
+}
+
+private enum CaptureStartTestError: Error { case unavailable }
+
+private final class FailingFirstCaptureEngine: CaptureEngine, @unchecked Sendable {
+    var onAudio: ((CapturedSample) -> Void)?
+    var remoteStreamActive = true
+    private let lock = NSLock()
+    private var startsStorage = 0
+    var starts: Int { lock.lock(); defer { lock.unlock() }; return startsStorage }
+
+    func start() async throws {
+        if nextStartShouldFail() { throw CaptureStartTestError.unavailable }
+    }
+
+    private func nextStartShouldFail() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        startsStorage += 1
+        return startsStorage == 1
+    }
+
+    func stop() async {}
+}
+
+/// Starts A immediately, then parks B inside `start()` until the test chooses
+/// the exact instant its capture-start failure resumes.
+private final class SuspendedSecondStartCaptureEngine: CaptureEngine, @unchecked Sendable {
+    var onAudio: ((CapturedSample) -> Void)?
+    var remoteStreamActive = true
+    private let lock = NSLock()
+    private var startsStorage = 0
+    private var releaseSecondStorage = false
+
+    var starts: Int { lock.lock(); defer { lock.unlock() }; return startsStorage }
+    func releaseSecondStart() { lock.lock(); releaseSecondStorage = true; lock.unlock() }
+
+    func start() async throws {
+        let call = nextStart()
+        guard call == 2 else { return }
+        while !secondStartReleased(), !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        throw CaptureStartTestError.unavailable
+    }
+
+    private func nextStart() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        startsStorage += 1
+        return startsStorage
+    }
+
+    private func secondStartReleased() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return releaseSecondStorage
+    }
+
+    func stop() async {}
 }
 
 /// Fusion runner mock: dequeues scripted outcomes (last is sticky) and can
@@ -358,6 +465,7 @@ final class SessionCoordinatorTests: XCTestCase {
         recorder.subscribe(to: coordinator)
 
         let session = try await coordinator.start()
+        XCTAssertEqual(transcriber.prepareCalls, 1)
         XCTAssertEqual(coordinator.displayState, .recording)
         XCTAssertEqual(try store.session(id: session.id)?.state, .recording)
 
@@ -396,8 +504,427 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertTrue(sawDone, "missing .done; events: \(recorder.events)")
         XCTAssertEqual(coordinator.displayState, .done(sessionId: session.id))
         XCTAssertEqual(recorder.displayStates, [
-            .recording, .processing, .done(sessionId: session.id),
+            .preparing, .recording, .processing, .done(sessionId: session.id),
         ])
+    }
+
+    func testPreparationReservesStartBeforeAwaitAndPrecedesCaptureAndRowCreation() async throws {
+        let store = try MeetingStore.inMemory()
+        let transcriber = SuspendedPreparationTranscriber()
+        let capture = CountingCaptureEngine()
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: capture,
+            transcriber: transcriber,
+            fusionRunner: { _ in .failure(.provider("unused")) }
+        )
+
+        let first = Task { try await coordinator.start() }
+        while transcriber.calls == 0 { try? await Task.sleep(nanoseconds: 2_000_000) }
+        XCTAssertEqual(coordinator.displayState, .preparing)
+        XCTAssertTrue(try store.allSessions().isEmpty)
+        XCTAssertEqual(capture.starts, 0)
+
+        do {
+            _ = try await coordinator.start()
+            XCTFail("concurrent Start must be rejected while preparation is suspended")
+        } catch {
+            XCTAssertEqual(error as? SessionCoordinatorError, .alreadyRecording)
+        }
+
+        transcriber.release()
+        _ = try await first.value
+        XCTAssertEqual(transcriber.calls, 1)
+        XCTAssertEqual(capture.starts, 1)
+        XCTAssertEqual(try store.allSessions().count, 1)
+        XCTAssertEqual(coordinator.displayState, .recording)
+        await coordinator.stop()
+    }
+
+    func testPreparationFailureRollsBackWithoutCaptureOrSessionRow() async throws {
+        let store = try MeetingStore.inMemory()
+        let transcriber = SuspendedPreparationTranscriber()
+        transcriber.failure = PreparationTestError.unavailable
+        transcriber.release()
+        let capture = CountingCaptureEngine()
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: capture,
+            transcriber: transcriber,
+            fusionRunner: { _ in .failure(.provider("unused")) }
+        )
+
+        do {
+            _ = try await coordinator.start()
+            XCTFail("preparation failure must fail Start")
+        } catch PreparationTestError.unavailable {}
+
+        XCTAssertEqual(coordinator.displayState, .idle)
+        XCTAssertEqual(capture.starts, 0)
+        XCTAssertTrue(try store.allSessions().isEmpty)
+    }
+
+    func testPreparingObserverCanReenterCoordinatorWithoutDeadlock() async throws {
+        let store = try MeetingStore.inMemory()
+        let transcriber = SuspendedPreparationTranscriber()
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: CountingCaptureEngine(),
+            transcriber: transcriber,
+            fusionRunner: { _ in .failure(.provider("unused")) }
+        )
+        let reentered = expectation(description: "preparing observer reentered coordinator")
+        let stream = coordinator.events()
+        let observer = Task {
+            for await event in stream {
+                guard event == .stateChanged(.preparing) else { continue }
+                XCTAssertEqual(coordinator.displayState, .preparing)
+                do {
+                    _ = try await coordinator.start()
+                    XCTFail("reentrant Start must observe the reservation")
+                } catch {
+                    XCTAssertEqual(error as? SessionCoordinatorError, .alreadyRecording)
+                }
+                reentered.fulfill()
+                return
+            }
+        }
+
+        let start = Task { try await coordinator.start() }
+        await fulfillment(of: [reentered], timeout: 5)
+        transcriber.release()
+        _ = try await start.value
+        await observer.value
+        XCTAssertEqual(coordinator.displayState, .recording)
+        await coordinator.stop()
+    }
+
+    func testPriorFusionCannotHidePreparationAndItsResultIsRestoredOnFailure() async throws {
+        let store = try MeetingStore.inMemory()
+        let transcriber = SuspendedPreparationTranscriber()
+        transcriber.release()
+        let capture = CountingCaptureEngine()
+        let fusion = GatedFusionRunner(
+            outcomes: [.success(noteId: UUID(), title: "Prior meeting")],
+            gateFromCall: 0
+        )
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: capture,
+            transcriber: transcriber,
+            fusionRunner: { await fusion.run($0) }
+        )
+
+        let prior = try await coordinator.start()
+        let stop = Task { await coordinator.stop() }
+        let fusionStarted = await fusion.waitUntilEntered(1)
+        XCTAssertTrue(fusionStarted)
+        XCTAssertEqual(coordinator.displayState, .processing)
+
+        transcriber.failure = PreparationTestError.unavailable
+        transcriber.suspend()
+        let nextStart = Task { try await coordinator.start() }
+        while transcriber.calls < 2 { try? await Task.sleep(nanoseconds: 2_000_000) }
+        XCTAssertEqual(coordinator.displayState, .preparing)
+
+        fusion.openGate()
+        await stop.value
+        XCTAssertEqual(coordinator.displayState, .preparing,
+                       "the prior fusion result must not hide an in-flight preparation")
+
+        transcriber.release()
+        do {
+            _ = try await nextStart.value
+            XCTFail("the second preparation should fail")
+        } catch PreparationTestError.unavailable {}
+
+        XCTAssertEqual(coordinator.displayState, .done(sessionId: prior.id))
+        XCTAssertEqual(capture.starts, 1)
+        XCTAssertEqual(try store.allSessions().count, 1)
+    }
+
+    func testPreparationFailurePublicationCannotOverwriteNewRecordingOrStop() async throws {
+        let store = try MeetingStore.inMemory()
+        let transcriber = SuspendedPreparationTranscriber()
+        transcriber.failure = PreparationTestError.unavailable
+        transcriber.release()
+        let capture = CountingCaptureEngine()
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: capture,
+            transcriber: transcriber,
+            fusionRunner: { _ in .failure(.provider("expected stop result")) }
+        )
+        let recorder = EventRecorder()
+        recorder.subscribe(to: coordinator)
+
+        let failureCommitted = expectation(description: "preparation failure transition committed")
+        let releaseOldPublisher = DispatchSemaphore(value: 0)
+        coordinator.onLifecycleFailureCommittedForTesting = { point in
+            guard case .preparation = point else { return }
+            failureCommitted.fulfill()
+            releaseOldPublisher.wait()
+        }
+
+        let failedStart = Task { try await coordinator.start() }
+        await fulfillment(of: [failureCommitted], timeout: 5)
+        transcriber.failure = nil
+
+        // Start B reaches recording while A's old fallback publication is
+        // still parked. The queued publisher must preserve transition order.
+        let recording = try await coordinator.start()
+        XCTAssertEqual(coordinator.currentSession?.id, recording.id)
+        XCTAssertEqual(coordinator.displayState, .recording)
+
+        releaseOldPublisher.signal()
+        do {
+            _ = try await failedStart.value
+            XCTFail("Start A must retain its preparation failure")
+        } catch PreparationTestError.unavailable {}
+
+        let recordingPublishedLast = await recorder.waitFor { _ in
+            recorder.displayStates.last == .recording
+        }
+        XCTAssertTrue(recordingPublishedLast, "stale A display landed last: \(recorder.displayStates)")
+        XCTAssertEqual(coordinator.currentSession?.id, recording.id)
+        XCTAssertEqual(coordinator.displayState, .recording)
+
+        await coordinator.stop()
+        XCTAssertEqual(try store.session(id: recording.id)?.state, .processing)
+        XCTAssertEqual(coordinator.displayState, .failed(sessionId: recording.id),
+                       "B's Stop UI action must remain functional")
+    }
+
+    func testEngineStartFailurePublicationCannotOverwriteNewRecordingOrStop() async throws {
+        let store = try MeetingStore.inMemory()
+        let transcriber = MockTranscriber()
+        let capture = FailingFirstCaptureEngine()
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: capture,
+            transcriber: transcriber,
+            fusionRunner: { _ in .failure(.provider("expected stop result")) }
+        )
+        let recorder = EventRecorder()
+        recorder.subscribe(to: coordinator)
+
+        let failureCommitted = expectation(description: "engine failure transition committed")
+        let releaseOldPublisher = DispatchSemaphore(value: 0)
+        coordinator.onLifecycleFailureCommittedForTesting = { point in
+            guard case .engineStart = point else { return }
+            failureCommitted.fulfill()
+            releaseOldPublisher.wait()
+        }
+
+        let failedStart = Task { try await coordinator.start() }
+        await fulfillment(of: [failureCommitted], timeout: 5)
+
+        let recording = try await coordinator.start()
+        XCTAssertEqual(coordinator.currentSession?.id, recording.id)
+        XCTAssertEqual(coordinator.displayState, .recording)
+
+        releaseOldPublisher.signal()
+        do {
+            _ = try await failedStart.value
+            XCTFail("Start A must retain its capture-engine failure")
+        } catch CaptureStartTestError.unavailable {}
+
+        let recordingPublishedLast = await recorder.waitFor { _ in
+            recorder.displayStates.last == .recording
+        }
+        XCTAssertTrue(recordingPublishedLast, "stale A idle landed last: \(recorder.displayStates)")
+        XCTAssertEqual(coordinator.currentSession?.id, recording.id)
+        XCTAssertEqual(coordinator.displayState, .recording)
+        XCTAssertEqual(try store.allSessions().map(\.id), [recording.id],
+                       "A cleanup must not delete or replace B's session")
+
+        await coordinator.stop()
+        XCTAssertEqual(try store.session(id: recording.id)?.state, .processing)
+        XCTAssertEqual(coordinator.displayState, .failed(sessionId: recording.id),
+                       "B's Stop UI action must remain functional")
+    }
+
+    func testEngineFailureRestoresPriorFailedSessionOwnershipAndRetry() async throws {
+        let store = try MeetingStore.inMemory()
+        let capture = SuspendedSecondStartCaptureEngine()
+        let fusion = MockFusionRunner(results: [
+            .failure(.provider("A needs retry")),
+            .success(noteId: UUID(), title: "A retried"),
+        ])
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: capture,
+            transcriber: MockTranscriber(),
+            fusionRunner: { await fusion.run($0) }
+        )
+        let recorder = EventRecorder()
+        recorder.subscribe(to: coordinator)
+
+        let a = try await coordinator.start()
+        await coordinator.stop()
+        XCTAssertEqual(coordinator.displayState, .failed(sessionId: a.id))
+        XCTAssertEqual(coordinator.lastFusionError, "A needs retry")
+
+        let startB = Task { try await coordinator.start() }
+        while capture.starts < 2 { try? await Task.sleep(nanoseconds: 2_000_000) }
+        let b = try XCTUnwrap(coordinator.currentSession)
+        XCTAssertNotEqual(b.id, a.id)
+        XCTAssertEqual(coordinator.displayState, .preparing)
+
+        capture.releaseSecondStart()
+        do {
+            _ = try await startB.value
+            XCTFail("B capture start must fail")
+        } catch CaptureStartTestError.unavailable {}
+
+        XCTAssertEqual(coordinator.currentSession?.id, a.id)
+        XCTAssertEqual(coordinator.displayState, .failed(sessionId: a.id))
+        XCTAssertEqual(coordinator.lastFusionError, "A needs retry")
+        XCTAssertNil(try store.session(id: b.id), "failure cleanup deletes only B")
+        XCTAssertEqual(try store.session(id: a.id)?.fusionErrorMessage, "A needs retry")
+
+        let restored = await recorder.waitFor { _ in
+            recorder.displayStates.last == .failed(sessionId: a.id)
+        }
+        XCTAssertTrue(restored)
+        XCTAssertEqual(recorder.displayStates, [
+            .preparing, .recording, .processing, .failed(sessionId: a.id),
+            .preparing, .failed(sessionId: a.id),
+        ], "B failure restores A once, without an idle or duplicate transition")
+
+        await coordinator.retryFusion()
+        XCTAssertEqual(coordinator.currentSession?.id, a.id)
+        XCTAssertEqual(coordinator.displayState, .done(sessionId: a.id))
+        XCTAssertEqual(try store.session(id: a.id)?.state, .complete)
+        XCTAssertEqual(fusion.calls.map(\.id), [a.id, a.id])
+    }
+
+    func testSuccessfulStartReplacesPriorFailedSessionAndClearsItsFusionError() async throws {
+        let store = try MeetingStore.inMemory()
+        let fusion = MockFusionRunner(results: [.failure(.provider("A needs retry"))])
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: CountingCaptureEngine(),
+            transcriber: MockTranscriber(),
+            fusionRunner: { await fusion.run($0) }
+        )
+
+        let a = try await coordinator.start()
+        await coordinator.stop()
+        XCTAssertEqual(coordinator.displayState, .failed(sessionId: a.id))
+        XCTAssertEqual(coordinator.lastFusionError, "A needs retry")
+
+        let b = try await coordinator.start()
+
+        XCTAssertNotEqual(b.id, a.id)
+        XCTAssertEqual(coordinator.currentSession?.id, b.id)
+        XCTAssertEqual(coordinator.displayState, .recording)
+        XCTAssertNil(coordinator.lastFusionError)
+        XCTAssertEqual(try store.session(id: a.id)?.fusionErrorMessage, "A needs retry",
+                       "A's session-scoped failure remains available in History")
+    }
+
+    func testPriorRetryFinishingDuringNewRecordingCannotReintroduceItsFusionError() async throws {
+        let store = try MeetingStore.inMemory()
+        let fusion = GatedFusionRunner(
+            outcomes: [
+                .failure(.provider("A needs retry")),
+                .failure(.provider("A retry failed late")),
+            ],
+            gateFromCall: 1
+        )
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: CountingCaptureEngine(),
+            transcriber: MockTranscriber(),
+            fusionRunner: { await fusion.run($0) }
+        )
+
+        let a = try await coordinator.start()
+        await coordinator.stop()
+        XCTAssertEqual(coordinator.lastFusionError, "A needs retry")
+
+        let retryA = Task { await coordinator.retryFusion() }
+        let retryEntered = await fusion.waitUntilEntered(2)
+        XCTAssertTrue(retryEntered)
+
+        let b = try await coordinator.start()
+        XCTAssertEqual(coordinator.currentSession?.id, b.id)
+        XCTAssertEqual(coordinator.displayState, .recording)
+        XCTAssertNil(coordinator.lastFusionError)
+
+        fusion.openGate()
+        await retryA.value
+
+        XCTAssertEqual(coordinator.currentSession?.id, b.id)
+        XCTAssertEqual(coordinator.displayState, .recording)
+        XCTAssertNil(coordinator.lastFusionError,
+                     "non-current A cannot project its late Retry failure onto B")
+        XCTAssertEqual(try store.session(id: a.id)?.fusionErrorMessage, "A retry failed late")
+    }
+
+    func testPriorFusionCompletingDuringBEngineStartUpdatesFailureFallback() async throws {
+        let store = try MeetingStore.inMemory()
+        let capture = SuspendedSecondStartCaptureEngine()
+        let fusion = GatedFusionRunner(
+            outcomes: [.failure(.provider("A failed during B start"))],
+            gateFromCall: 0
+        )
+        let coordinator = SessionCoordinator(
+            store: store,
+            captureEngine: capture,
+            transcriber: MockTranscriber(),
+            fusionRunner: { await fusion.run($0) }
+        )
+        let recorder = EventRecorder()
+        recorder.subscribe(to: coordinator)
+
+        let a = try await coordinator.start()
+        let stopA = Task { await coordinator.stop() }
+        let fusionEntered = await fusion.waitUntilEntered(1)
+        XCTAssertTrue(fusionEntered)
+        XCTAssertEqual(coordinator.displayState, .processing)
+
+        let startB = Task { try await coordinator.start() }
+        while capture.starts < 2 { try? await Task.sleep(nanoseconds: 2_000_000) }
+        let b = try XCTUnwrap(coordinator.currentSession)
+        XCTAssertNotEqual(b.id, a.id)
+        XCTAssertEqual(coordinator.displayState, .preparing)
+
+        fusion.openGate()
+        await stopA.value
+        XCTAssertEqual(coordinator.displayState, .preparing,
+                       "A completion updates fallback without hiding B preparation")
+        let sawOneFusionFailure = await recorder.waitFor { events in
+            events.filter {
+                if case .fusionFailed(let id, _) = $0 { return id == a.id }
+                return false
+            }.count == 1
+        }
+        XCTAssertTrue(sawOneFusionFailure)
+
+        capture.releaseSecondStart()
+        do {
+            _ = try await startB.value
+            XCTFail("B capture start must fail")
+        } catch CaptureStartTestError.unavailable {}
+
+        XCTAssertEqual(coordinator.currentSession?.id, a.id)
+        XCTAssertEqual(coordinator.currentSession?.fusionErrorMessage, "A failed during B start")
+        XCTAssertEqual(coordinator.displayState, .failed(sessionId: a.id))
+        XCTAssertEqual(coordinator.lastFusionError, "A failed during B start")
+        XCTAssertNil(try store.session(id: b.id))
+        let restored = await recorder.waitFor { _ in
+            recorder.displayStates.last == .failed(sessionId: a.id)
+        }
+        XCTAssertTrue(restored)
+        XCTAssertEqual(recorder.displayStates, [
+            .preparing, .recording, .processing, .preparing, .failed(sessionId: a.id),
+        ], "A completion is suppressed during B and restored exactly once after B fails")
+        XCTAssertEqual(recorder.events.filter {
+            if case .fusionFailed(let id, _) = $0 { return id == a.id }
+            return false
+        }.count, 1, "A fusion failure is announced once")
     }
 
     // Fusion failure: session stays .processing, error surfaced, derived
@@ -447,6 +974,7 @@ final class SessionCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(sawDone)
         XCTAssertEqual(recorder.displayStates, [
+            .preparing,
             .recording,
             .processing,
             .failed(sessionId: session.id),

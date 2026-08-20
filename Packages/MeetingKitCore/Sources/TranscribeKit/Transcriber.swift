@@ -20,7 +20,27 @@ public struct AudioChunk: Sendable {
 /// Streaming-style transcription seam. WhisperKit is chunked batch over
 /// rolling VAD windows, not true streaming — this protocol hides that (SPEC §4.2).
 public protocol Transcriber: Sendable {
+    /// Makes the transcriber ready before capture starts. Production uses
+    /// this to prewarm and load Core ML; lightweight implementations can use
+    /// the default no-op.
+    func prepare() async throws
+
+    /// Returns the transcriber bound to a newly admitted session. Production
+    /// uses this handle to keep the selected model stable for both channel
+    /// streams even if Settings or background prewarming changes afterward
+    /// (SPEC §4.2: model changes apply at the next session, never mid-session).
+    func prepareForSession() async throws -> any Transcriber
+
     func transcribe(stream: AsyncStream<AudioChunk>) -> AsyncStream<TranscriptSegment>
+}
+
+public extension Transcriber {
+    func prepare() async throws {}
+
+    func prepareForSession() async throws -> any Transcriber {
+        try await prepare()
+        return self
+    }
 }
 
 public struct TranscriptSegment: Sendable, Equatable {

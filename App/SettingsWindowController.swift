@@ -241,17 +241,11 @@ enum WhisperModelOption: CaseIterable {
 @MainActor
 final class SettingsWindowController: NSObject {
 
-    /// The live Settings window. `ScribeApp` owns the instance, but the model
-    /// row is now the app's only recovery route for a missing speech model,
-    /// so code that has to OFFER that route (see
-    /// `LazyWhisperKitTranscriber.presentMissingModelNotice`) needs to reach
-    /// it without a reference threaded through the composition root. Weak:
-    /// this is a lookup, never an owner.
-    private(set) static weak var current: SettingsWindowController?
-
     private let logger = Logger(subsystem: "io.github.vasu014.scribe", category: "settings")
     private let keychain = KeychainStore()
     private let window: NSWindow
+    /// App-owned hook for best-effort preparation after selection/download.
+    var onSpeechModelReady: (() -> Void)?
 
     // Group 1 — API key
     private var maskedKeyLabel: NSTextField!
@@ -301,7 +295,6 @@ final class SettingsWindowController: NSObject {
             defer: false
         )
         super.init()
-        Self.current = self
         window.title = "Settings"
         window.isReleasedWhenClosed = false
         window.backgroundColor = .windowBackgroundColor
@@ -814,6 +807,9 @@ final class SettingsWindowController: NSObject {
         cancelModelDownload()
         UserDefaults.standard.set(WhisperModelOption.allCases[index].name, forKey: SettingsKeys.whisperModel)
         refreshModelSection()
+        if downloads.isDownloaded(SettingsKeys.whisperModelName) {
+            onSpeechModelReady?()
+        }
     }
 
     /// Fetches the SELECTED variant with `ModelDownloadManager` — the same
@@ -844,6 +840,7 @@ final class SettingsWindowController: NSObject {
                     self.modelDownload = .downloading(variant: variant, fraction: fraction)
                 case .completed:
                     self.modelDownload = .idle // presence check takes over
+                    self.onSpeechModelReady?()
                 case .failed(let message):
                     self.logger.error("""
                     Model download failed for '\(variant, privacy: .public)': \
@@ -903,7 +900,7 @@ final class SettingsWindowController: NSObject {
                 modelDownloadButton.isHidden = true
             } else {
                 modelCaption.stringValue =
-                    "Not downloaded (\(option.approximateSize)) — meetings won’t be transcribed"
+                    "Not downloaded (\(option.approximateSize)) — meetings can’t start"
                 modelCaption.textColor = .systemRed
                 modelDownloadButton.isHidden = false
                 modelDownloadButton.title = "Download"

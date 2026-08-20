@@ -391,6 +391,7 @@ final class ScratchpadPanelController: NSObject {
     /// True between summon and dismiss (including during the animations).
     private var isVisibleToUser = false
     private var isRecording: Bool
+    private var isPreparing: Bool
 
     init(coordinator: SessionCoordinator, composer: FragmentComposer) {
         self.coordinator = coordinator
@@ -427,6 +428,7 @@ final class ScratchpadPanelController: NSObject {
         )
         bodyTextView = BodyTextView()
         isRecording = coordinator.displayState == .recording
+        isPreparing = coordinator.displayState == .preparing
 
         super.init()
         buildContent()
@@ -657,7 +659,7 @@ final class ScratchpadPanelController: NSObject {
             )
         } else {
             dotView.setAccessibilityLabel("Not recording")
-            headerStack.setAccessibilityLabel("No meeting")
+            headerStack.setAccessibilityLabel(isPreparing ? "Preparing speech model" : "No meeting")
         }
     }
 
@@ -918,8 +920,10 @@ final class ScratchpadPanelController: NSObject {
     /// fragments to, so the panel shows the honest no-meeting state.
     private func apply(_ state: SessionDisplayState) {
         let recording = state == .recording
-        guard recording != isRecording else { return }
+        let preparing = state == .preparing
+        guard recording != isRecording || preparing != isPreparing else { return }
         isRecording = recording
+        isPreparing = preparing
         if recording {
             startFailureMessage = nil // a start succeeded — the notice is stale
         }
@@ -952,8 +956,11 @@ final class ScratchpadPanelController: NSObject {
 
         elapsedLabel.isHidden = !recording
         noMeetingLabel.isHidden = recording
+        noMeetingLabel.stringValue = isPreparing ? "Preparing speech model…" : "No meeting"
         stopButton.isHidden = !recording
         startButton.isHidden = recording
+        startButton.title = isPreparing ? "Preparing…" : "Start Meeting"
+        startButton.isEnabled = !isPreparing
         savedLabel.isHidden = !recording // nothing persists with no session
         scrollView.isHidden = !recording
         noMeetingHint.isHidden = recording
@@ -970,7 +977,9 @@ final class ScratchpadPanelController: NSObject {
 
         // Body face text: the no-meeting hint, or an inline start failure
         // (finding 7 — never log-only).
-        if let startFailureMessage {
+        if isPreparing {
+            applyBodyHint("Preparing speech model… Recording will start when it’s ready.", color: HUDPalette.mutedText)
+        } else if let startFailureMessage {
             applyBodyHint(startFailureMessage, color: HUDPalette.failureText)
         } else {
             applyBodyHint(Self.noMeetingHintText, color: HUDPalette.mutedText)
@@ -1211,9 +1220,7 @@ final class ScratchpadPanelController: NSObject {
                 try await coordinator.start()
             } catch {
                 logger.error("Meeting start failed from panel: \(String(describing: error), privacy: .public)")
-                showStartFailure(
-                    "Couldn’t start the meeting. Check microphone and screen access, then try again."
-                )
+                showStartFailure(error.localizedDescription)
             }
         }
     }

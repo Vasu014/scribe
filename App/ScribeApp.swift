@@ -163,10 +163,11 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
             provider: provider,
             lookback: lookback
         )
+        let transcriber = LazyWhisperKitTranscriber()
         coordinator = SessionCoordinator(
             store: store,
             captureEngine: captureMonitor,
-            transcriber: LazyWhisperKitTranscriber(),
+            transcriber: transcriber,
             lookback: lookback,
             fusionRunner: fusionRunner
         )
@@ -197,6 +198,10 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
 
         // MARK: Surfaces.
         settingsWindowController = SettingsWindowController()
+        settingsWindowController.onSpeechModelReady = { [weak coordinator] in
+            guard let coordinator else { return }
+            Task { await coordinator.prepareTranscriberInBackground() }
+        }
         menuBarController = MenuBarController(coordinator: coordinator)
         menuBarController.onOpenSettings = { [weak settingsWindowController] in
             settingsWindowController?.show()
@@ -395,6 +400,8 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
         // completed (phase 5) it never shows on launch again.
         if SetupWizardPhase.persisted != .completed {
             showSetupWizard(at: SetupWizardPhase.persisted)
+        } else {
+            Task { await coordinator.prepareTranscriberInBackground() }
         }
 
         scheduleDebugAutoStart() // dev tooling; no-op on a normal launch
@@ -404,6 +411,10 @@ final class ScribeApp: NSObject, NSApplicationDelegate {
     private func showSetupWizard(at step: SetupWizardPhase) {
         if setupWizardController == nil {
             setupWizardController = SetupWizardController()
+            setupWizardController?.onSpeechModelReady = { [weak coordinator] in
+                guard let coordinator else { return }
+                Task { await coordinator.prepareTranscriberInBackground() }
+            }
         }
         setupWizardController?.show(at: step)
     }

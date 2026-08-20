@@ -605,6 +605,9 @@ final class HistoryWindowController: NSObject {
         }
 
         emptyStateView.isHidden = !sessions.isEmpty // design 2d face swap
+        let preparing = coordinator.displayState == .preparing
+        emptyStateStartButton.title = preparing ? "Preparing speech model…" : "Start Meeting"
+        emptyStateStartButton.isEnabled = !preparing
         refreshDetailIfNeeded()
         updateActions()
         syncFusingTimer()

@@ -84,6 +84,9 @@ enum SetupWizardPhase: Int {
 @MainActor
 final class SetupWizardController: NSObject {
 
+    /// App-owned hook for best-effort preparation after the setup download.
+    var onSpeechModelReady: (() -> Void)?
+
     private static let windowWidth: CGFloat = 440
     private static let contentWidth: CGFloat = 400 // 440 − 2×20 outer margins
     private static let cardBodyWidth: CGFloat = 372 // 400 − 2×14 card insets
@@ -179,6 +182,7 @@ final class SetupWizardController: NSObject {
         phase = next
         SetupWizardPhase.store(next)
         if next == .completed {
+            onSpeechModelReady?()
             window.orderOut(nil) // never shown on launch again
         } else {
             render()
@@ -607,7 +611,7 @@ final class SetupWizardController: NSObject {
             statusRow,
             actionRow,
             makeBodyLabel(
-                "Until the model finishes, meetings record but are not transcribed. "
+                "Meetings can’t start until the speech model is ready. "
                     + "Retry any time — the download resumes instead of restarting.",
                 width: Self.cardBodyWidth
             ),
@@ -650,6 +654,7 @@ final class SetupWizardController: NSObject {
             modelState = .downloading(fraction)
         case .completed:
             modelState = .completed
+            onSpeechModelReady?()
         case .failed(let message):
             modelState = .failed(message)
         }

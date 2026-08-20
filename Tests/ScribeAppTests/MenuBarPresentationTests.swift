@@ -11,7 +11,7 @@ import XCTest
 final class MenuBarPresentationTests: XCTestCase {
 
     private let allStates: [SessionDisplayState] = [
-        .idle, .recording, .processing, .done(sessionId: UUID()), .failed(sessionId: UUID()),
+        .idle, .preparing, .recording, .processing, .done(sessionId: UUID()), .failed(sessionId: UUID()),
     ]
 
     // MARK: Retry Fusion (SPEC §5)
@@ -22,6 +22,7 @@ final class MenuBarPresentationTests: XCTestCase {
     func testRetryFusionAppearsInTheFailureStateOnly() {
         XCTAssertTrue(MenuBarPresentation.retryFusionIsVisible(in: .failed(sessionId: UUID())))
         XCTAssertFalse(MenuBarPresentation.retryFusionIsVisible(in: .idle))
+        XCTAssertFalse(MenuBarPresentation.retryFusionIsVisible(in: .preparing))
         XCTAssertFalse(MenuBarPresentation.retryFusionIsVisible(in: .recording))
         XCTAssertFalse(MenuBarPresentation.retryFusionIsVisible(in: .processing))
         XCTAssertFalse(MenuBarPresentation.retryFusionIsVisible(in: .done(sessionId: UUID())))
@@ -33,6 +34,7 @@ final class MenuBarPresentationTests: XCTestCase {
     func testOpenNotesAppearsInTheDoneTransientOnly() {
         XCTAssertTrue(MenuBarPresentation.openNotesIsVisible(in: .done(sessionId: UUID())))
         XCTAssertFalse(MenuBarPresentation.openNotesIsVisible(in: .idle))
+        XCTAssertFalse(MenuBarPresentation.openNotesIsVisible(in: .preparing))
         XCTAssertFalse(MenuBarPresentation.openNotesIsVisible(in: .recording))
         XCTAssertFalse(MenuBarPresentation.openNotesIsVisible(in: .processing))
         XCTAssertFalse(MenuBarPresentation.openNotesIsVisible(in: .failed(sessionId: UUID())))
@@ -58,8 +60,11 @@ final class MenuBarPresentationTests: XCTestCase {
     /// one may begin.
     func testStartStopTitleTracksRecordingOnly() {
         XCTAssertEqual(MenuBarPresentation.startStopTitle(in: .recording), "Stop Meeting")
+        XCTAssertEqual(MenuBarPresentation.startStopTitle(in: .preparing), "Preparing speech model…")
         for state in allStates where state != .recording {
-            XCTAssertEqual(MenuBarPresentation.startStopTitle(in: state), "Start Meeting", "\(state)")
+            if state != .preparing {
+                XCTAssertEqual(MenuBarPresentation.startStopTitle(in: state), "Start Meeting", "\(state)")
+            }
         }
     }
 
@@ -85,7 +90,7 @@ final class MenuBarPresentationTests: XCTestCase {
     /// would drop a LIVE recording capsule back to the idle waveform with the
     /// microphone open — the one thing SPEC §5's consent posture forbids.
     func testDoneRevertDoesNotClobberAStateThatMovedOn() {
-        for state in [SessionDisplayState.idle, .recording, .processing, .failed(sessionId: UUID())] {
+        for state in [SessionDisplayState.idle, .preparing, .recording, .processing, .failed(sessionId: UUID())] {
             XCTAssertNil(MenuBarPresentation.stateAfterDoneHold(state), "\(state)")
         }
     }
@@ -167,7 +172,7 @@ final class MenuBarPresentationTests: XCTestCase {
     /// Help is for the states that need it. A permanent help string on idle
     /// or recording is read out on every focus and becomes noise.
     func testStatesWithNothingToExplainCarryNoHelp() {
-        for state in [SessionDisplayState.idle, .recording, .processing] {
+        for state in [SessionDisplayState.idle, .preparing, .recording, .processing] {
             XCTAssertNil(MenuBarPresentation.announcement(for: state, elapsed: 12).help, "\(state)")
         }
     }

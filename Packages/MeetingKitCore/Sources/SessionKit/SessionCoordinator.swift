@@ -108,9 +108,29 @@ public final class SessionCoordinator: @unchecked Sendable {
 
     // Mutable state, guarded by `lock`.
     private let lock = NSLock()
-    private enum Phase: Equatable { case idle, recording, stopping, processing }
+    private enum Phase: Equatable { case idle, preparing, recording, stopping, processing }
     private var phase: Phase = .idle
     private var displayStateStorage: SessionDisplayState = .idle
+    /// Monotonically identifies the Start attempt that owns lifecycle writes.
+    /// Any completion that resumes after a newer Start must be a no-op.
+    private var lifecycleGeneration: UInt64 = 0
+    /// State to restore if a reserved Start fails before capture begins. A
+    /// previous session may finish fusion while Start owns the visible
+    /// `.preparing` reservation; those transitions update this fallback
+    /// instead of hiding preparation or losing the previous Retry target.
+    private struct PreparationFallback {
+        var phase: Phase
+        var display: SessionDisplayState
+        var currentSession: SessionRecord?
+        var clock: SessionClock?
+        var lastFusionError: String?
+    }
+    private var preparationFallback: PreparationFallback?
+    /// Display events are queued while lifecycle state is locked, then
+    /// drained by one publisher after unlocking. This preserves state/event
+    /// order without invoking observers under `lock` (observers may re-enter).
+    private var pendingDisplayEvents: [SessionDisplayState] = []
+    private var isPublishingDisplayEvents = false
     private var currentSessionStorage: SessionRecord?
     private var clockStorage: SessionClock?
     /// The recording session's transcript pipeline, TAGGED with the id of the
@@ -142,6 +162,13 @@ public final class SessionCoordinator: @unchecked Sendable {
     private var pendingFragmentId: UUID?
     private var pendingFragmentAnchor: TimeInterval?
     private var lastFusionErrorStorage: String?
+
+    #if DEBUG
+    /// Deterministic test seam: runs after a failure transition is committed
+    /// and queued, but before its publisher drains. Never invoked under lock.
+    enum LifecycleFailureTestPoint { case preparation, engineStart }
+    var onLifecycleFailureCommittedForTesting: (@Sendable (LifecycleFailureTestPoint) -> Void)?
+    #endif
 
     /// - Parameters:
     ///   - store: the single store every component reads/writes (SPEC §3.1).
@@ -250,6 +277,15 @@ public final class SessionCoordinator: @unchecked Sendable {
 
     // MARK: Lifecycle
 
+    /// Best-effort background preparation. Start still awaits the same seam,
+    /// and the production transcriber single-flights both callers. Never
+    /// changes the active recording's retained model.
+    public func prepareTranscriberInBackground() async {
+        let allowed = withLock { phase == .idle || phase == .processing }
+        guard allowed else { return }
+        try? await transcriber.prepare()
+    }
+
     /// Starts a session: creates the session row (wall-clock `startedAt`
     /// stored once, SPEC §4.1), starts the session clock, wires capture →
     /// per-channel transcription → immediate segment upserts
@@ -260,19 +296,45 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// session, and the error is rethrown.
     @discardableResult
     public func start() async throws -> SessionRecord {
-        try withLock {
+        let reservation = try withLock { () throws -> (generation: UInt64, shouldPublish: Bool) in
             guard phase == .idle || phase == .processing else {
                 throw SessionCoordinatorError.alreadyRecording
             }
+            // Reserve synchronously before the first await. Concurrent Start
+            // calls cannot both prepare, create rows, or start capture.
+            lifecycleGeneration &+= 1
+            preparationFallback = PreparationFallback(
+                phase: phase,
+                display: displayStateStorage,
+                currentSession: currentSessionStorage,
+                clock: clockStorage,
+                lastFusionError: lastFusionErrorStorage
+            )
+            phase = .preparing
+            return (lifecycleGeneration, queueDisplayLocked(.preparing))
+        }
+        if reservation.shouldPublish { publishPendingDisplayEvents() }
+
+        let sessionTranscriber: any Transcriber
+        do {
+            sessionTranscriber = try await transcriber.prepareForSession()
+        } catch {
+            restoreAfterFailedPreparation(generation: reservation.generation)
+            throw error
         }
 
-        // Session row first: a crash between here and engine start leaves an
-        // empty `recording` row — acceptable, and recovery handles it.
-        let session = try store.createSession()
+        let session: SessionRecord
+        do {
+            session = try store.createSession()
+        } catch {
+            restoreAfterFailedPreparation(generation: reservation.generation)
+            throw error
+        }
         let clock = SessionClock()
-        let pipeline = TranscriptPipeline(store: store, sessionId: session.id, transcriber: transcriber)
+        let pipeline = TranscriptPipeline(store: store, sessionId: session.id, transcriber: sessionTranscriber)
 
         withLock {
+            guard lifecycleGeneration == reservation.generation, phase == .preparing else { return }
             clockStorage = clock
             pipelineStorage = (session.id, pipeline)
             currentSessionStorage = session
@@ -285,22 +347,51 @@ public final class SessionCoordinator: @unchecked Sendable {
         do {
             try await engine.start()
         } catch {
-            engine.onAudio = nil
-            await engine.stop()
+            let ownsFailedStart = withLock {
+                lifecycleGeneration == reservation.generation
+                    && phase == .recording
+                    && currentSessionStorage?.id == session.id
+            }
+            if ownsFailedStart {
+                engine.onAudio = nil
+                await engine.stop()
+            }
             // Nothing to drain: the engine never delivered a sample, and the
             // caller is a UI click waiting on this throw — don't sit on a
             // transcriber that may still be loading its model.
             _ = await pipeline.finish(timeout: 0)
             clearPipeline(for: session.id)
-            withLock {
-                phase = .idle
-                currentSessionStorage = nil
-                clockStorage = nil
-            }
             try? store.deleteSession(id: session.id)
+            let shouldPublish = withLock { () -> Bool in
+                guard lifecycleGeneration == reservation.generation,
+                      phase == .recording,
+                      currentSessionStorage?.id == session.id else { return false }
+                let fallback = preparationFallback
+                phase = fallback?.phase ?? .idle
+                currentSessionStorage = fallback?.currentSession
+                clockStorage = fallback?.clock
+                lastFusionErrorStorage = fallback?.lastFusionError
+                preparationFallback = nil
+                return queueDisplayLocked(fallback?.display ?? .idle)
+            }
+            #if DEBUG
+            onLifecycleFailureCommittedForTesting?(.engineStart)
+            #endif
+            if shouldPublish { publishPendingDisplayEvents() }
             throw error
         }
-        setDisplay(.recording)
+        let shouldPublish = withLock { () -> Bool in
+            guard lifecycleGeneration == reservation.generation,
+                  phase == .recording,
+                  currentSessionStorage?.id == session.id else { return false }
+            // Capture is live, so this session now owns the coordinator's
+            // projection. A prior session's Retry reason remains on its row,
+            // but must not leak into the new recording's scalar state.
+            lastFusionErrorStorage = nil
+            preparationFallback = nil
+            return queueDisplayLocked(.recording)
+        }
+        if shouldPublish { publishPendingDisplayEvents() }
         return session
     }
 
@@ -339,12 +430,12 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// call while a stop is already in flight returns immediately (it does
     /// not wait for the first one's fusion).
     public func stop() async {
-        let held: (session: SessionRecord, clock: SessionClock, composer: FragmentComposer?, pipeline: TranscriptPipeline?)? = withLock {
+        let held: (session: SessionRecord, clock: SessionClock, composer: FragmentComposer?, pipeline: TranscriptPipeline?, generation: UInt64)? = withLock {
             guard phase == .recording,
                   let session = currentSessionStorage,
                   let clock = clockStorage else { return nil }
             phase = .stopping
-            return (session, clock, composerStorage, pipelineStorage?.pipeline)
+            return (session, clock, composerStorage, pipelineStorage?.pipeline, lifecycleGeneration)
         }
         guard let held else { return }
         let session = held.session
@@ -364,11 +455,15 @@ public final class SessionCoordinator: @unchecked Sendable {
         row.state = .processing
         try? store.updateSession(row)
 
-        withLock {
+        let shouldPublish = withLock { () -> Bool in
+            guard lifecycleGeneration == held.generation,
+                  phase == .stopping,
+                  currentSessionStorage?.id == session.id else { return false }
             phase = .processing
             currentSessionStorage = row
+            return queueDisplayLocked(.processing)
         }
-        setDisplay(.processing)
+        if shouldPublish { publishPendingDisplayEvents() }
 
         // 4. Drain transcription into the store, bounded, then finalize.
         if let pipeline = held.pipeline {
@@ -391,13 +486,7 @@ public final class SessionCoordinator: @unchecked Sendable {
         defer { releaseFusion(for: row.id) }
 
         let outcome = await fusionRunner(row)
-        // `drivesDisplay` is resolved at APPLY time, after the await — not at
-        // entry and not before the call. Fusion is a long network call and
-        // the user may have started the next meeting DURING it; resolving any
-        // earlier hands this finished run permission to overwrite the live
-        // `.recording` display state of a session that is still running.
-        let drivesDisplay = withLock { currentSessionStorage?.id == row.id }
-        apply(outcome, to: row, drivesDisplay: drivesDisplay)
+        apply(outcome, to: row)
     }
 
     /// Re-runs fusion for a session stuck in `processing` after a failure
@@ -434,19 +523,9 @@ public final class SessionCoordinator: @unchecked Sendable {
         // still-running attempt will re-report.
         try? store.clearFusionFailure(sessionId: row.id)
 
-        if resolved.drivesDisplay {
-            // Entry-time resolution is correct HERE: this fires before the
-            // await, while `resolved` is still true.
-            setDisplay(.processing) // leave the ⚠ state while retrying
-        }
+        if resolved.drivesDisplay { setDisplay(.processing, for: row.id) }
         let outcome = await fusionRunner(row)
-        // Re-resolved at APPLY time (mirrors `stop()`): a retry that
-        // completes during a LATER recording must not overwrite that
-        // session's `.recording` display state — doing so hides the chip and
-        // flips the menu item back to "Start Meeting", leaving a live meeting
-        // the user has no way to stop.
-        let drivesDisplay = withLock { currentSessionStorage?.id == row.id }
-        apply(outcome, to: row, drivesDisplay: drivesDisplay)
+        apply(outcome, to: row)
     }
 
     // MARK: Interruptions (SPEC §4.1/§4.4)
@@ -567,9 +646,65 @@ public final class SessionCoordinator: @unchecked Sendable {
         withLock { _ = fusionsInFlight.remove(sessionId) }
     }
 
-    private func setDisplay(_ state: SessionDisplayState) {
-        withLock { displayStateStorage = state }
-        eventBus.emit(.stateChanged(state))
+    private func setDisplay(_ state: SessionDisplayState, for sessionId: UUID? = nil) {
+        let shouldPublish = withLock {
+            guard sessionId == nil || currentSessionStorage?.id == sessionId else { return false }
+            // A previous session's fusion may complete while a new Start is
+            // awaiting model preparation. Preserve its resulting state for
+            // rollback, but keep every Start surface visibly preparing.
+            if phase == .preparing, state != .preparing {
+                if var fallback = preparationFallback {
+                    fallback.display = state
+                    preparationFallback = fallback
+                }
+                return false
+            }
+            return queueDisplayLocked(state)
+        }
+        if shouldPublish { publishPendingDisplayEvents() }
+    }
+
+    /// Must be called only while `lock` is held. Returns whether this caller
+    /// became the sole queue drainer.
+    private func queueDisplayLocked(_ state: SessionDisplayState) -> Bool {
+        displayStateStorage = state
+        pendingDisplayEvents.append(state)
+        guard !isPublishingDisplayEvents else { return false }
+        isPublishingDisplayEvents = true
+        return true
+    }
+
+    /// Publishes in the exact order transitions acquired `lock`. The bus is
+    /// invoked after releasing the lifecycle lock, so observers may re-enter.
+    private func publishPendingDisplayEvents() {
+        while true {
+            let state = withLock { () -> SessionDisplayState? in
+                guard !pendingDisplayEvents.isEmpty else {
+                    isPublishingDisplayEvents = false
+                    return nil
+                }
+                return pendingDisplayEvents.removeFirst()
+            }
+            guard let state else { return }
+            eventBus.emit(.stateChanged(state))
+        }
+    }
+
+    private func restoreAfterFailedPreparation(generation: UInt64) {
+        let shouldPublish = withLock { () -> Bool in
+            guard lifecycleGeneration == generation, phase == .preparing else { return false }
+            let fallback = preparationFallback
+            phase = fallback?.phase ?? .idle
+            currentSessionStorage = fallback?.currentSession
+            clockStorage = fallback?.clock
+            lastFusionErrorStorage = fallback?.lastFusionError
+            preparationFallback = nil
+            return queueDisplayLocked(fallback?.display ?? .idle)
+        }
+        #if DEBUG
+        onLifecycleFailureCommittedForTesting?(.preparation)
+        #endif
+        if shouldPublish { publishPendingDisplayEvents() }
     }
 
     private func logDeviceEvent(kind: String, relay: Bool = false) {
@@ -641,19 +776,18 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// `FusionService`, which already stored the note, title, and state —
     /// these updates are idempotent and cover mock runners that touch
     /// nothing. The coordinator owns the lifecycle transitions regardless of
-    /// who wrote them first. Menu-bar display state moves only when
-    /// `drivesDisplay` (the session is the coordinator's current one);
-    /// session-scoped events (findings, failure) are emitted regardless so
-    /// History surfaces them.
+    /// who wrote them first. Menu-bar display state moves only if the session
+    /// is still current at the atomic display transition; session-scoped
+    /// events (findings, failure) are emitted regardless so History surfaces
+    /// them.
     ///
     /// The failure REASON is written to the session row here as well as
     /// emitted (`SessionRecord.fusionErrorMessage`, schema v2). The event is
     /// the immediate path for a surface that is already listening; the column
     /// is what a surface opened in a LATER launch reads, so a permanently
     /// failed session still says why instead of spinning forever. Both the
-    /// write and the clear are outside the `drivesDisplay` guard: the row is
-    /// session-scoped truth, not menu-bar display state.
-    private func apply(_ outcome: FusionRunOutcome, to session: SessionRecord, drivesDisplay: Bool) {
+    /// write and the clear are session-scoped truth, not menu-bar state.
+    private func apply(_ outcome: FusionRunOutcome, to session: SessionRecord) {
         let fresh = (try? store.session(id: session.id)) ?? session
         switch outcome {
         case let .success(_, title):
@@ -663,10 +797,7 @@ public final class SessionCoordinator: @unchecked Sendable {
             row.fusionErrorMessage = nil // this attempt worked (SPEC §4.5 Retry)
             row.fusionFailedAt = nil
             try? store.updateSession(row)
-            if drivesDisplay {
-                withLock { lastFusionErrorStorage = nil }
-                setDisplay(.done(sessionId: session.id))
-            }
+            setFusionDisplay(.done(sessionId: session.id), row: row, error: nil)
 
         case let .storedWithFindings(_, title, findings):
             var row = fresh
@@ -675,10 +806,7 @@ public final class SessionCoordinator: @unchecked Sendable {
             row.fusionErrorMessage = nil // a note WAS stored — findings are not a failure
             row.fusionFailedAt = nil
             try? store.updateSession(row)
-            if drivesDisplay {
-                withLock { lastFusionErrorStorage = nil }
-                setDisplay(.processing)
-            }
+            setFusionDisplay(.processing, row: row, error: nil)
             eventBus.emit(.fusionFindings(sessionId: session.id, findings: findings))
 
         case let .failure(error):
@@ -686,12 +814,35 @@ public final class SessionCoordinator: @unchecked Sendable {
             // Row stays `processing` (SPEC §4.5); the reason is what makes
             // that state readable as "failed, Retry available".
             try? store.recordFusionFailure(sessionId: session.id, message: message)
-            if drivesDisplay {
-                withLock { lastFusionErrorStorage = message }
-                setDisplay(.failed(sessionId: session.id))
-            }
+            let row = (try? store.session(id: session.id)) ?? fresh
+            setFusionDisplay(.failed(sessionId: session.id), row: row, error: message)
             eventBus.emit(.fusionFailed(sessionId: session.id, message: message))
         }
+    }
+
+    /// Applies the fusion error/display projection only while `sessionId`
+    /// still owns the coordinator. The ownership check, fallback update, and
+    /// queued display transition are one locked operation.
+    private func setFusionDisplay(
+        _ state: SessionDisplayState,
+        row: SessionRecord,
+        error: String?
+    ) {
+        let shouldPublish = withLock { () -> Bool in
+            if var fallback = preparationFallback,
+               fallback.currentSession?.id == row.id {
+                fallback.currentSession = row
+                fallback.display = state
+                fallback.lastFusionError = error
+                preparationFallback = fallback
+                return false
+            }
+            guard currentSessionStorage?.id == row.id else { return false }
+            currentSessionStorage = row
+            lastFusionErrorStorage = error
+            return queueDisplayLocked(state)
+        }
+        if shouldPublish { publishPendingDisplayEvents() }
     }
 
     private static func describe(_ error: FusionServiceError) -> String {

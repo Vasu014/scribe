@@ -311,6 +311,7 @@ final class MenuBarController: NSObject {
     private static func probeKey(_ state: SessionDisplayState) -> String {
         switch state {
         case .idle: return "idle"
+        case .preparing: return "preparing"
         case .recording: return "recording"
         case .processing: return "processing"
         case .done: return "done"
@@ -440,7 +441,7 @@ final class MenuBarController: NSObject {
             startStopItem.title = MenuBarPresentation.startStopTitle(in: displayState)
             startStopItem.keyEquivalent = MenuBarPresentation.startStopKeyEquivalent(in: displayState)
         }
-        startStopItem.isEnabled = true // Start from idle/processing/failed; Stop while recording
+        startStopItem.isEnabled = displayState != .preparing
     }
 
     // MARK: - Actions
@@ -462,11 +463,20 @@ final class MenuBarController: NSObject {
             do {
                 try await coordinator.start()
             } catch {
-                // Permission loss is preempted by the guard above; anything
-                // reaching here is an engine failure worth logging.
                 logger.error("Meeting start failed: \(String(describing: error), privacy: .public)")
+                await MainActor.run { self.presentStartFailure(error) }
             }
         }
+    }
+
+    private func presentStartFailure(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn’t start the meeting"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func retryFusion() {
@@ -586,6 +596,8 @@ final class MenuBarController: NSObject {
         case .idle:
             attachMenu()
             statusItem.button?.image = StatusGlyphs.waveform
+        case .preparing:
+            applyProcessingVisual()
         case .recording:
             attachMenu()
             refreshRecordingVisual()
@@ -998,7 +1010,8 @@ enum MenuBarPresentation {
     /// including from `processing` and `failed`, where a previous meeting is
     /// still being fused but a new one may begin.
     static func startStopTitle(in state: SessionDisplayState) -> String {
-        state == .recording ? "Stop Meeting" : "Start Meeting"
+        if state == .preparing { return "Preparing speech model…" }
+        return state == .recording ? "Stop Meeting" : "Start Meeting"
     }
 
     /// ⌘. (the macOS stop/cancel idiom) is advertised only while there is
@@ -1084,6 +1097,8 @@ enum MenuBarPresentation {
         switch state {
         case .idle:
             return Announcement(label: idleLabel, value: nil, help: nil)
+        case .preparing:
+            return Announcement(label: "Scribe — preparing speech model", value: nil, help: nil)
         case .recording:
             let spoken = spokenElapsed(elapsed)
             return Announcement(label: "Scribe — recording, \(spoken)", value: spoken, help: nil)
