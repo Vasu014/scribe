@@ -6,7 +6,7 @@
 **Platform baseline:** macOS 14.0+ · Apple Silicon only (both dogfood machines are M-series)
 **UI reference:** `design/` (canonical — HTML spec sheet + README handoff)
 
-**Changelog v1.2 → v1.3:** Product named **Scribe** (`Scribe.xcodeproj`, target/display name Scribe; internal package keeps the name `MeetingKitCore`). Whisper model is a **user setting** (default `small.en`; `large-v3-turbo` offered with large-download flag; Spike 2 may add it to the matrix) — resolves the build-time-vs-picker contradiction. Fragment autosave redefined as the **pending-row pattern** (§4.3): the in-progress fragment persists as a mutable row on ~1 s debounce; burst boundary freezes it; Saved tick fires on actual persist. Lookback window is a user setting (advanced), default 20 s. §5 rewritten around the design handoff: menu-bar and History states are **derived UI states** mapped from session states (no schema change); Done transient (4 s, clickable) and Failure persistent states; recovered tag; inline validator warnings; Export Eval Case action; action-item checkboxes are static glyphs. Project generation via XcodeGen.
+**Changelog v1.2 → v1.3:** Product named **Scribe** (`Scribe.xcodeproj`, target/display name Scribe; internal package keeps the name `MeetingKitCore`). Whisper model is a **user setting**. Phase 0 product correction: the default is Argmax's multilingual `large-v3-v20240930_turbo` (~1.64 GB), selected for English/Hindi code-switched meetings on the 16 GB M4 dogfood machine. Fragment autosave redefined as the **pending-row pattern** (§4.3): the in-progress fragment persists as a mutable row on ~1 s debounce; burst boundary freezes it; Saved tick fires on actual persist. Lookback window is a user setting (advanced), default 20 s. §5 rewritten around the design handoff: menu-bar and History states are **derived UI states** mapped from session states (no schema change); Done transient (4 s, clickable) and Failure persistent states; recovered tag; inline validator warnings; Export Eval Case action; action-item checkboxes are static glyphs. Project generation via XcodeGen.
 
 **Changelog v1.1 → v1.2:** Validator redesigned: deterministic quote-based validation replaces "topically related" (normalization-tolerant string matching against text-only rendering; LLM-judge topicality deferred to a named Phase 1+ experiment). Canonical rendering block pinned (single formatter/parser, per-timestamp hours rule, round-trip test); `prompt_version` documented as covering prompt text **and** rendering format. Eval case export path added (History action + pinned self-contained JSON schema + weekly merge ritual). Title sanitization. Chunked fusion renders global session offsets (validator code path unchanged). Session clock pinned to `mach_continuous_time`; elapsed display derives from wall clock.
 
@@ -121,7 +121,7 @@ System audio ─────────┘                                     
 **Responsibility:** Streaming-style speech-to-text for both channels, on-device.
 
 - **Engine:** WhisperKit. Note: WhisperKit is **chunked batch transcription over rolling VAD windows**, not true streaming — the `Transcriber` protocol below is the seam that hides this.
-- **Model (user setting):** default `small.en` (both machines are M-series; 3–5 s finalization is realistic). Settings offers `tiny.en` / `base.en` / `small.en` / `large-v3-turbo` (the last flagged as a large download). Changing the model applies at the **next session start**, never mid-session.
+- **Model (user setting):** default Argmax WhisperKit variant `large-v3-v20240930_turbo` (folder `openai_whisper-large-v3-v20240930_turbo`, ~1.64 GB), selected for English, Hindi and code-switched meetings on the 16 GB M4 dogfood machine. Settings retains the smaller English/multilingual and Hinglish alternatives; the default is displayed as **Multilingual — Large** and flagged as a large download. Changing the model applies at the **next session start**, never mid-session. Existing stored `large-v3-turbo` and `large-v3_turbo` selections remain parse aliases and are not rewritten until the user explicitly changes the picker.
 - **Shared model, serial queues (architecture decision):** **one** WhisperKit model instance, **two serial inference queues** (one per channel). Two model instances (~1 GB RAM, GPU contention) are explicitly rejected. Consequence: the busier channel (usually `remote`) lags the quieter one. Acceptable for v0 — nothing consumes the transcript live — but stamp each segment with `inferredAt` (inference completion time) separately from audio offsets, so Phase 2 live-notes work starts with a real latency distribution.
 - **Interface:**
 
@@ -142,7 +142,7 @@ struct TranscriptSegment {
 ```
 
 - **Upsert semantics (hard rule):** segments get a UUID at hypothesis creation; a revised hypothesis **replaces** the row on that ID — never appends. This is what makes the crash-recovery test meaningful: without it, the 5s-persistence kill-test passes while the recovered transcript is full of duplicates. The Phase 0 exit gate (§2.2) checks for this explicitly.
-- **Chunking:** WhisperKit's built-in energy VAD. Target segment finalization within ~3–5 s of speech ending.
+- **Chunking:** energy-VAD windows. Each window decodes with language detection enabled and task `.transcribe`; no fixed English language prompt is supplied. This supports language changes between windows but does not promise romanized Hindi. Target segment finalization remains a dogfood measurement, not a transliteration guarantee.
 - **No temp audio on disk:** verify WhisperKit's configuration writes no temporary audio files (part of the §4.6 retention audit).
 - Model download on first launch with progress UI.
 
@@ -285,7 +285,7 @@ Session storage states (§4.4) are `recording | processing | complete` (+ `recov
 - **Do not invest here.** Scheduled for deletion in Phase 3 when the webapp becomes the read surface.
 
 ### Settings
-- API key (Keychain; masked, edit-in-place) · Whisper model picker (`tiny.en` / `base.en` / `small.en` default / `large-v3-turbo` flagged large; applies next session) · lookback window (advanced, default 20 s) · launch at login.
+- API key (Keychain; masked, edit-in-place) · Whisper model picker (**Multilingual — Large** default, canonical variant `large-v3-v20240930_turbo`, ~1.64 GB and flagged large; smaller/specialized alternatives retained; applies next session) · lookback window (advanced, default 20 s) · launch at login.
 
 ### Setup wizard
 - Explains permissions → mic prompt → Screen Recording prompt → "quit and reopen" instruction → resumes via `setupPhase` flag on relaunch → model download → API key entry → done.
@@ -315,7 +315,7 @@ Known interference on macOS 14.x: activating SCK audio capture while an AVAudioE
 - Fallback ladder: fixed start order → voice processing off (accept bleed) → same-engine mic tap restructure.
 
 ### Spike 2: WhisperKit shared-model throughput (Engineer A)
-- One `small.en` instance, two serial queues, simulated two-channel load (play a recorded call). Optionally add `large-v3-turbo` to the matrix (Settings offers it; know its cost before users pick it).
+- One `large-v3-v20240930_turbo` instance, two serial queues, simulated two-channel English/Hindi code-switched load (play a recorded call) on the 16 GB M4 dogfood machine.
 - Measure: finalization latency per channel, RAM, GPU contention, lag of busier channel.
 - Success: p95 finalization ≤ 5 s on both machines. (Both are M-series; if this fails, something is misconfigured — investigate before downgrading the model.)
 

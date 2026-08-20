@@ -89,10 +89,10 @@ final class TranscriptPipeline: @unchecked Sendable {
     ///
     /// BOUNDED BY DESIGN. The consumer tasks await whatever the injected
     /// `Transcriber` does, and a production transcriber can stall
-    /// unboundedly before it ever looks at its input stream — the app's
-    /// `LazyWhisperKitTranscriber` resolves (and, on a cold Hub cache,
-    /// FETCHES) a ~500 MB Core ML model inside `transcribe(stream:)`, so
-    /// finishing the input stream does not finish the output stream. An
+    /// unboundedly before it ever looks at its input stream. It may still be
+    /// decoding a large Core ML model
+    /// window when its input finishes, so finishing the input stream does not
+    /// finish the output stream. An
     /// unbounded wait here hung `SessionCoordinator.stop()` forever: the
     /// session never reached `processing`, the Stop button became a no-op,
     /// and the row was left in `recording` (T10 dogfood bug). Stopping a

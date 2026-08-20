@@ -468,6 +468,25 @@ final class ModelDownloadManagerTests: XCTestCase {
         XCTAssertFalse(manager.isDownloaded("large-v3-turbo"))
     }
 
+    func testIsDownloadedDoesNotAcceptCompressedPrefixSibling() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "scribe-mdm-prefix-\(UUID().uuidString)")
+        let sibling = root.appending(
+            path: "snapshots/abc/openai_whisper-large-v3-v20240930_turbo_632MB/Decoder.mlmodelc"
+        )
+        try FileManager.default.createDirectory(
+            at: sibling.appending(path: "weights"),
+            withIntermediateDirectories: true
+        )
+        try Data(repeating: 0, count: 2_000_000)
+            .write(to: sibling.appending(path: "weights/weight.bin"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let manager = ModelDownloadManager(modelRoot: root)
+        XCTAssertFalse(manager.isDownloaded("large-v3-v20240930_turbo"))
+        XCTAssertTrue(manager.isDownloaded("large-v3-v20240930_turbo_632MB"))
+    }
+
     func testDefaultRootIsScribeAppSupportModels() {
         XCTAssertTrue(
             ModelDownloadManager.defaultModelRoot.path

@@ -47,8 +47,8 @@ public struct ModelDownloadManager: Sendable {
         modelRoot.appending(path: name)
     }
 
-    /// Best-effort presence check: looks for a folder whose name contains the
-    /// variant name AND holds compiled Core ML model bundles. Heuristic —
+    /// Best-effort presence check: looks for the exact variant folder and
+    /// compiled Core ML model bundles. Heuristic —
     /// the authoritative check is attempting `WhisperKitEngine` load.
     public func isDownloaded(_ name: String) -> Bool {
         guard let enumerator = FileManager.default.enumerator(
@@ -61,12 +61,22 @@ public struct ModelDownloadManager: Sendable {
             // match a bundle whose parent folder is the named variant.
             if url.lastPathComponent.hasSuffix(".mlmodelc") {
                 let parent = url.deletingLastPathComponent()
-                if parent.lastPathComponent.contains(name), Self.hasWeights(url) {
+                if Self.folderName(parent.lastPathComponent, matchesVariant: name),
+                   Self.hasWeights(url) {
                     return true
                 }
             }
         }
         return false
+    }
+
+    /// WhisperKit's catalogue folders use `openai_whisper-<variant>` while
+    /// converted/custom repositories may expose `<variant>` directly. Match
+    /// only those two complete spellings: substring matching makes a shorter
+    /// model name resolve whichever compressed/prefixed sibling happens to be
+    /// enumerated first.
+    public static func folderName(_ folderName: String, matchesVariant variant: String) -> Bool {
+        folderName == variant || folderName == "openai_whisper-\(variant)"
     }
 
     /// A `.mlmodelc` bundle is only usable once its WEIGHTS are present.

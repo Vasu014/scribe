@@ -43,6 +43,30 @@ final class WhisperComputeProfileTests: XCTestCase {
     }
 }
 
+final class WhisperEngineConfigurationTests: XCTestCase {
+    func testDefaultModelAndConfigurationNeverDownloadImplicitly() {
+        XCTAssertEqual(WhisperKitEngine.defaultModelName, "large-v3-v20240930_turbo")
+
+        let config = WhisperKitEngine.configuration(
+            modelName: WhisperKitEngine.defaultModelName,
+            modelFolder: "/tmp/existing-model"
+        )
+        XCTAssertEqual(config.model, "large-v3-v20240930_turbo")
+        XCTAssertEqual(config.modelFolder, "/tmp/existing-model")
+        XCTAssertFalse(config.download)
+        XCTAssertFalse(config.useBackgroundDownloadSession)
+    }
+
+    func testDecodingDetectsLanguagePerWindowWhileRemainingTranscription() {
+        let options = WhisperKitEngine.decodingOptions
+
+        XCTAssertEqual(options.task, .transcribe)
+        XCTAssertNil(options.language, "no fixed language may prefill multilingual decoding")
+        XCTAssertTrue(options.detectLanguage)
+        XCTAssertTrue(options.skipSpecialTokens)
+    }
+}
+
 /// Item 20, downstream half: what the transcription side costs while nobody
 /// is speaking. This is the work the capture-side `SilenceGate` removes —
 /// with the gate in place these chunks never arrive at all.

@@ -109,8 +109,8 @@ final class LazyWhisperKitTranscriber: Transcriber, @unchecked Sendable {
     /// TEST SEAM (dev tooling; sibling of
     /// `WhisperKitTranscriber.reviseForTesting`): replaces model resolution,
     /// so a harness can drive session boundaries — a stalled load, a
-    /// timed-out drain, a back-to-back restart — without a 500 MB Core ML
-    /// load and without speech audio. Never set on any app path.
+    /// timed-out drain, a back-to-back restart — without a Core ML load and
+    /// without speech audio. Never set on any app path.
     nonisolated(unsafe) static var engineFactoryForTesting: (@Sendable (String) async -> (any WhisperEngine)?)?
     enum EngineBuildAccess: Hashable, Sendable { case started, joined }
     /// Fires from the resolver actor only after a keyed build has actually
@@ -370,8 +370,9 @@ enum WhisperModelLocator {
     }
 
     /// Locates a downloaded variant's folder under `root`, mirroring the
-    /// heuristic `ModelDownloadManager.isDownloaded` uses: a compiled Core ML
-    /// bundle (`*.mlmodelc`) whose parent folder is named for the variant (the
+    /// exact matching rule `ModelDownloadManager.isDownloaded` uses: a
+    /// compiled Core ML bundle (`*.mlmodelc`) whose parent folder is named
+    /// for the variant (the
     /// Hub cache nests it as `…/snapshots/<hash>/openai_whisper-<variant>/`).
     /// Returns the variant folder for `WhisperKitEngine(modelFolder:)`.
     ///
@@ -389,7 +390,10 @@ enum WhisperModelLocator {
         for case let url as URL in enumerator {
             guard url.pathExtension == "mlmodelc" else { continue }
             let variantFolder = url.deletingLastPathComponent()
-            if variantFolder.lastPathComponent.contains(variant) {
+            if ModelDownloadManager.folderName(
+                variantFolder.lastPathComponent,
+                matchesVariant: variant
+            ) {
                 return variantFolder
             }
         }

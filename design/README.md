@@ -48,7 +48,7 @@ Standard titled window ~760×470. **Do not invest** — scheduled for deletion i
 ### 4. Settings window — design 1e
 Single pane, ~520 pt wide, System Settings grouped-row style: window bg `#F5F4F2`, groups are white cards radius 9, 0.5 pt border `black 10%`, rows padded 11 pt vertically with hairline separators inside a group. Labels 13 pt; captions 11 pt `black 45%`.
 1. **Anthropic API Key** — caption "Stored in the macOS Keychain". Display masked (`••••••••••7f2a`, monospace); edit-in-place secure field. Store in Keychain, never plist.
-2. **Whisper Model** — popup button. Default `small.en`; options `tiny.en` / `base.en` / `small.en` / `large-v3-turbo` (flag the last as a large download). User setting, not build-time.
+2. **Whisper Model** — popup button. Default **Multilingual — Large** (`large-v3-v20240930_turbo`, ~1.64 GB; flag as a large download). Smaller and specialized options remain available. User setting, not build-time.
 3. **Lookback Window** — caption "Advanced — how far back fusion anchors a fragment in the transcript"; popup (`20 seconds`, the v0 default). Fusion-time transcript-anchoring only — raw audio is never retained.
 4. **Launch at Login** — standard switch (`systemGreen` on).
 

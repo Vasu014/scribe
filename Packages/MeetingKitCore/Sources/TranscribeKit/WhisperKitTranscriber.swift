@@ -117,8 +117,7 @@ struct SegmentIdCache {
 ///   bursts are dropped (coughs, clicks).
 /// - Window CLOSES (inference dispatched) once ≥ `hangoverSeconds`
 ///   (0.8 s) of trailing silence accumulates — the "≥800 ms silence after
-///   ≥1 s speech" rule; with a ~2 s `small.en` decode on M-series that
-///   lands finalization ~3–5 s after speech ends (SPEC §4.2).
+///   ≥1 s speech" rule; model inference follows before finalization.
 /// - Hard cap `maxWindowSeconds` (30 s) forces emission during unbroken
 ///   monologues so buffers stay bounded.
 /// - A session-clock gap > `gapTolerance` (device switch, SPEC §4.1 honest

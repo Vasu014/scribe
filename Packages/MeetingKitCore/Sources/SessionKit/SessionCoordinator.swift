@@ -85,10 +85,9 @@ public final class SessionCoordinator: @unchecked Sendable {
     /// How long `stop()` waits for the transcript pipeline to drain before
     /// abandoning it and going on to fusion (see `stop()` step 4).
     ///
-    /// The 10 s default is generous against the real finalization budget — a
-    /// `small.en` window decodes in ~2 s and SPEC §4.2 puts finalization 3–5 s
-    /// after speech ends — while staying far below "the app is broken". It
-    /// exists to bound a STALLED transcriber, not to rush a working one.
+    /// This exists to bound a STALLED transcriber, not to rush a working one.
+    /// The default leaves room for the multilingual Large model to finish an
+    /// in-flight window on the supported 16 GB M4 dogfood hardware.
     public let transcriptDrainTimeout: TimeInterval
 
     private let store: MeetingStore
@@ -191,10 +190,9 @@ public final class SessionCoordinator: @unchecked Sendable {
         captureEngine: any CaptureEngine,
         transcriber: any Transcriber,
         lookback: TimeInterval = 20,
-        // 10 s was tuned against `small.en` (480 MB). A larger model — the
-        // 890 MB Hinglish fine-tune, or large-v3 — takes materially longer to
-        // load AND to decode a 30 s window, so 10 s cut inference off before a
-        // single segment was persisted and the meeting came back empty. This
+        // A short drain tuned against small.en cut larger-model inference off
+        // before a single segment was persisted and the meeting came back
+        // empty. The multilingual Large model is now the default, so this
         // budget only bounds a transcriber that has STOPPED making progress
         // (the failure it was added for), so it can afford to be generous:
         // stopping a healthy session still returns as soon as the drain ends.

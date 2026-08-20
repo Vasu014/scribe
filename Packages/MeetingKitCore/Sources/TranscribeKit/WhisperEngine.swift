@@ -130,6 +130,9 @@ extension WhisperComputeProfile.Unit {
 public actor WhisperKitEngine: WhisperEngine {
     private let whisper: WhisperKit
 
+    /// Keep direct/unused callers aligned with the app setting default.
+    public static let defaultModelName = "large-v3-v20240930_turbo"
+
     /// Compute-unit preference handed to Core ML (item 24). This is
     /// WhisperKit's own default value, constructed EXPLICITLY rather than
     /// left to `computeOptions: nil`, so the resolved units are observable
@@ -139,19 +142,28 @@ public actor WhisperKitEngine: WhisperEngine {
     static var computeOptions: ModelComputeOptions { ModelComputeOptions() }
 
     /// - Parameters:
-    ///   - modelName: WhisperKit variant, e.g. `small.en` (user setting, SPEC §4.2).
+    ///   - modelName: WhisperKit variant (user setting, SPEC §4.2).
     ///   - modelFolder: Local folder the model was fetched into
     ///     (`ModelDownloadManager.download` completion URL). `nil` lets
     ///     WhisperKit resolve its default search paths.
-    public init(modelName: String = "small.en", modelFolder: String? = nil) async throws {
-        let compute = Self.computeOptions
+    public init(
+        modelName: String = WhisperKitEngine.defaultModelName,
+        modelFolder: String? = nil
+    ) async throws {
+        let config = Self.configuration(modelName: modelName, modelFolder: modelFolder)
         Logger(subsystem: "io.github.vasu014.scribe", category: "transcriber").info("""
-        WhisperKit compute units: \(WhisperComputeProfile(compute).summary, privacy: .public)
+        WhisperKit compute units: \(WhisperComputeProfile(Self.computeOptions).summary, privacy: .public)
         """)
-        let config = WhisperKitConfig(
+        self.whisper = try await WhisperKit(config)
+    }
+
+    /// Pure configuration seam: tests pin the no-network load contract
+    /// without constructing WhisperKit or loading a real Core ML model.
+    static func configuration(modelName: String, modelFolder: String?) -> WhisperKitConfig {
+        WhisperKitConfig(
             model: modelName,
             modelFolder: modelFolder,
-            computeOptions: compute,
+            computeOptions: computeOptions,
             verbose: false,
             logLevel: .none,
             // WhisperKit performs these stages in order during init. Keeping
@@ -164,7 +176,6 @@ public actor WhisperKitEngine: WhisperEngine {
             download: false,
             useBackgroundDownloadSession: false
         )
-        self.whisper = try await WhisperKit(config)
     }
 
     public func transcribeBuffer(_ samples: [Float]) async throws -> [WhisperHypothesis] {
@@ -177,6 +188,11 @@ public actor WhisperKitEngine: WhisperEngine {
         // overloads, which we never call. No cache/temp-write options exist
         // on this API; there is nothing left to disable.
         //
+        // Language is intentionally not prefilled. Each VAD window detects
+        // its own language so English/Hindi code-switching stays in
+        // transcription mode instead of being forced through an English
+        // prompt. This does not request transliteration or romanized Hindi.
+        //
         // `skipSpecialTokens: true` is the ROOT-CAUSE fix for token leakage:
         // WhisperKit's default (`false`) decodes the control tokens
         // (`<|startoftranscript|>`, `<|en|>`, `<|0.00|>`, `<|endoftext|>`…)
@@ -184,10 +200,9 @@ public actor WhisperKitEngine: WhisperEngine {
         // `segment.start`/`.end`, which are computed from the timestamp
         // token IDS, so window offsets are unchanged. Everything else stays
         // at WhisperKit's defaults (what `decodeOptions: nil` used).
-        let options = DecodingOptions(skipSpecialTokens: true)
         let results = try await whisper.transcribe(
             audioArray: samples,
-            decodeOptions: options,
+            decodeOptions: Self.decodingOptions,
             segmentCallback: nil
         )
         guard let result = results.first else { return [] }
@@ -201,5 +216,15 @@ public actor WhisperKitEngine: WhisperEngine {
                 endSeconds: Double(segment.end)
             )
         }
+    }
+
+    /// `.transcribe` is explicit to keep language detection from ever being
+    /// mistaken for translation during a dependency upgrade.
+    static var decodingOptions: DecodingOptions {
+        DecodingOptions(
+            task: .transcribe,
+            detectLanguage: true,
+            skipSpecialTokens: true
+        )
     }
 }

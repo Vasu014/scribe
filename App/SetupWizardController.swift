@@ -712,12 +712,8 @@ final class SetupWizardController: NSObject {
     }
 
     private static func sizeHint(_ variant: String) -> String {
-        switch variant {
-        case "tiny.en": return "~75 MB"
-        case "base.en": return "~150 MB"
-        case "small.en": return "~500 MB"
-        default: return "large, over 1 GB"
-        }
+        guard let option = WhisperModelOption(named: variant) else { return "size varies" }
+        return "~\(option.approximateSize)"
     }
 
     // MARK: Step 4 — API key (optional; Keychain, SPEC §4.5/§5)

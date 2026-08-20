@@ -393,8 +393,8 @@ Conventions used in the tables:
 | API key field | letter-spacing | `.14em` | |
 | group 2 | rows | 2 rows: Whisper Model, Lookback Window | separated by hairline |
 | Whisper Model label | text | `Whisper Model` | |
-| Whisper Model popup | value | `small.en` | default [README] |
-| Whisper Model popup | options | `tiny.en` / `base.en` / `small.en` / `large-v3-turbo` [README] | flag `large-v3-turbo` as a large download |
+| Whisper Model popup | value | `Multilingual — Large` | default; canonical variant `large-v3-v20240930_turbo` [README] |
+| Whisper Model popup | options | English/multilingual/Hinglish size-and-script titles from `WhisperModelOption` [README] | flag `Multilingual — Large` (~1.64 GB) and other large variants as large downloads |
 | Lookback label | text | `Lookback Window` | |
 | Lookback caption | text | `Advanced — how far back fusion anchors a fragment in the transcript` | |
 | Lookback popup | value | `20 seconds` | v0 default |

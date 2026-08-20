@@ -122,21 +122,60 @@ final class WhisperModelLocatorTests: XCTestCase {
         XCTAssertNil(WhisperModelLocator.locateModelFolder(root: root, variant: "large-v3"))
     }
 
-    /// `large-v3` and `large-v3-turbo` both live under the same root; the
-    /// heuristic matches on `contains`, so the caller asking for the turbo
-    /// variant must not be handed the plain one.
+    /// Exact matching prevents a base variant and its compressed/prefixed
+    /// sibling from resolving according to filesystem enumeration order.
     func testDistinctVariantsResolveToTheirOwnFolders() throws {
         let plain = try makeVariant("large-v3")
-        let turbo = try makeVariant("large-v3-turbo")
+        let turbo = try makeVariant("large-v3-v20240930_turbo")
+        _ = try makeVariant("large-v3-v20240930_turbo_632MB")
 
         XCTAssertEqual(
-            WhisperModelLocator.locateModelFolder(root: root, variant: "large-v3-turbo")?.lastPathComponent,
+            WhisperModelLocator.locateModelFolder(
+                root: root,
+                variant: "large-v3-v20240930_turbo"
+            )?.lastPathComponent,
             turbo.lastPathComponent
         )
-        // NOTE: `large-v3` matches BOTH folder names by `contains`, so which
-        // one wins is enumeration order. Assert only that it is one of them —
-        // pinning it would encode filesystem ordering as a requirement.
-        let resolved = WhisperModelLocator.locateModelFolder(root: root, variant: "large-v3")?.lastPathComponent
-        XCTAssertTrue([plain.lastPathComponent, turbo.lastPathComponent].contains(resolved))
+        XCTAssertEqual(
+            WhisperModelLocator.locateModelFolder(root: root, variant: "large-v3")?.lastPathComponent,
+            plain.lastPathComponent
+        )
+    }
+}
+
+final class WhisperModelOptionTests: XCTestCase {
+    private var previousSelection: Any?
+
+    override func setUp() {
+        super.setUp()
+        previousSelection = UserDefaults.standard.object(forKey: SettingsKeys.whisperModel)
+        UserDefaults.standard.removeObject(forKey: SettingsKeys.whisperModel)
+    }
+
+    override func tearDown() {
+        if let previousSelection {
+            UserDefaults.standard.set(previousSelection, forKey: SettingsKeys.whisperModel)
+        } else {
+            UserDefaults.standard.removeObject(forKey: SettingsKeys.whisperModel)
+        }
+        super.tearDown()
+    }
+
+    func testMultilingualLargeIsTheCanonicalDefault() {
+        XCTAssertEqual(WhisperModelOption.defaultsCase, .largeV3Turbo)
+        XCTAssertEqual(SettingsKeys.defaultWhisperModel, "large-v3-v20240930_turbo")
+        XCTAssertEqual(SettingsKeys.whisperModelName, "large-v3-v20240930_turbo")
+        XCTAssertEqual(WhisperModelOption.largeV3Turbo.displayTitle, "Multilingual — Large")
+        XCTAssertEqual(WhisperModelOption.largeV3Turbo.approximateSize, "1.64 GB")
+    }
+
+    func testLegacyTurboSpellingsParseWithoutRewritingStoredSelection() {
+        for legacy in ["large-v3-turbo", "large-v3_turbo"] {
+            UserDefaults.standard.set(legacy, forKey: SettingsKeys.whisperModel)
+
+            XCTAssertEqual(WhisperModelOption(named: legacy), .largeV3Turbo)
+            XCTAssertEqual(SettingsKeys.whisperModelName, "large-v3-v20240930_turbo")
+            XCTAssertEqual(UserDefaults.standard.string(forKey: SettingsKeys.whisperModel), legacy)
+        }
     }
 }

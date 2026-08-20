@@ -17,7 +17,7 @@
 # Package.resolved/Sparkle trap (AGENTS.md), isolated DerivedData for parallel
 # agents, and a verification summary instead of a list of installs.
 #
-# What it deliberately does NOT do: download the ~500 MB Whisper model or set
+# What it deliberately does NOT do: download the ~1.64 GB default Whisper model or set
 # an Anthropic API key. Both are user-level concerns; you can build, test and
 # screenshot every UI surface without either. It reports their status only.
 #
@@ -243,7 +243,7 @@ MODEL_DIR="$HOME/Library/Application Support/Scribe/models"
 if [ -d "$MODEL_DIR" ] && [ -n "$(ls -A "$MODEL_DIR" 2>/dev/null)" ]; then
     READY+=("Whisper model present ($(du -sh "$MODEL_DIR" 2>/dev/null | cut -f1) in $MODEL_DIR)")
 else
-    SKIPPED+=("Whisper model (~500 MB) — not needed to build, test or screenshot. Meetings will NOT transcribe without it; get it from the app's setup wizard.")
+    SKIPPED+=("Whisper model (~1.64 GB default) — not needed to build, test or screenshot. Meetings will NOT transcribe without it; get it from the app's setup wizard.")
 fi
 SKIPPED+=("Anthropic API key — Keychain, user-level. Not needed to build or test; fusion is a no-op without it.")
 

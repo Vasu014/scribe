@@ -67,7 +67,7 @@ those quotes anywhere in the transcript.*
 |---|---|
 | macOS | 14 or later, **Apple Silicon** |
 | Permissions | Microphone, and Screen Recording (macOS routes other participants' audio through it) |
-| Disk | ~500 MB for the Whisper model |
+| Disk | ~1.6 GB for the default Whisper model |
 | API key | An [Anthropic API key](https://console.anthropic.com/) for fusion — stored in your Keychain |
 
 Screen Recording is used for **audio only**. Scribe captures a 2×2-pixel video
@@ -104,7 +104,8 @@ A setup wizard walks you through, and resumes where it left off if interrupted:
 1. **Microphone** — standard prompt.
 2. **Screen Recording** — requires quitting and reopening once; macOS only
    applies this grant on relaunch.
-3. **Whisper model** — downloads `small.en` (~500 MB) with progress.
+3. **Whisper model** — downloads multilingual `large-v3-v20240930_turbo`
+   (~1.64 GB) with progress.
 4. **API key** — optional at setup; without it meetings still record and
    transcribe, they just cannot be fused into notes.
 
@@ -150,9 +151,12 @@ and notes are already saved, so a retry costs nothing but the API call.
 
 - **Anthropic API Key** — stored in the macOS Keychain, never in a plist.
   Deleting it is undoable for 10 seconds.
-- **Whisper Model** — `tiny.en` / `base.en` / `small.en` (default) /
-  `large-v3_turbo`. Shows download state and offers Download; applies at the
-  next session start, never mid-meeting.
+- **Whisper Model** — defaults to **Multilingual — Large** (canonical variant
+  `large-v3-v20240930_turbo`, ~1.64 GB) for English/Hindi code-switched
+  meetings; smaller and specialized options remain available. It detects the
+  language per audio window while staying in transcription mode; it does not
+  promise romanized Hindi. Shows download state and offers Download; applies
+  at the next session start, never mid-meeting.
 - **Lookback Window** — how far back fusion anchors a fragment in the
   transcript. Anchoring only; raw audio is never retained.
 - **Launch at Login**

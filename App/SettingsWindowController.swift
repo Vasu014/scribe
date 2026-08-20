@@ -9,7 +9,7 @@ import os
 /// UserDefaults keys + defaults for Scribe's user settings (SPEC §5 Settings).
 /// The Settings window writes; `ScribeApp` reads at wiring time.
 enum SettingsKeys {
-    /// Whisper model name (SPEC §4.2 user setting, default `small.en`).
+    /// Whisper model name (SPEC §4.2 user setting, default multilingual Large v3 Turbo).
     /// Stored as the raw variant name; changing it applies at the NEXT
     /// session start, never mid-session.
     static let whisperModel = "whisperModel"
@@ -40,8 +40,8 @@ enum SettingsKeys {
     static let debugUseStubCapture = "debugUseStubCapture"
 }
 
-/// Whisper model picker entries (SPEC §4.2: `tiny.en` / `base.en` /
-/// `small.en` default / `large-v3-turbo` flagged as a large download).
+/// Whisper model picker entries (SPEC §4.2). The multilingual Large v3 Turbo
+/// model is the default for English, Hindi and code-switched meetings.
 enum WhisperModelOption: CaseIterable {
     case tinyEN
     case baseEN
@@ -102,36 +102,26 @@ enum WhisperModelOption: CaseIterable {
     /// 51866, i.e. exactly large-v3 shaped, so WhisperKit picks the large-v3
     /// tokenizer from the decoder's logits width on its own.
     ///
-    /// The `_fp16` suffix on the folder is load-bearing. `WhisperModelLocator`
-    /// finds a variant by `contains(variant)` and returns the FIRST match, so
-    /// a folder named for the bare model version would be a prefix of
-    /// `Oriserve_Whisper-Hindi2Hinglish-Prime_889MB` — the broken quantized
-    /// build in `.hinglish`, which is on disk right next to it — and the
-    /// selection would resolve to whichever the directory enumerator reached
-    /// first. The suffix makes neither name a substring of the other.
+    /// The `_fp16` suffix distinguishes this variant from the broken `_889MB`
+    /// quantized build. Folder lookup now matches complete variant names, so
+    /// compressed/prefixed siblings cannot win by enumeration order.
     case hinglishLargeRomanized
 
-    static let defaultsCase = WhisperModelOption.smallEN
+    static let defaultsCase = WhisperModelOption.largeV3Turbo
 
     /// The WhisperKit variant id — what gets persisted, fetched
     /// (`ModelDownloadManager`) and loaded (`WhisperKitEngine`).
     ///
-    /// SPEC §4.2 spells the last one `large-v3-turbo`; the model repo
-    /// (`argmaxinc/whisperkit-coreml`) publishes it as
-    /// `openai_whisper-large-v3_turbo`, i.e. variant `large-v3_turbo`, and
-    /// WhisperKit resolves a variant by globbing `*openai*<variant>/*`. The
-    /// spec's spelling matches NOTHING in the repo, so picking that option
-    /// used to fail with `No models found matching "*openai*large-v3-turbo/*"`
-    /// — an option the app offers and can never satisfy. The repo's id wins:
-    /// this is a name in someone else's namespace, and the alternative is a
-    /// picker entry that is permanently broken.
+    /// Canonical WhisperKit variant in Argmax's catalogue. Persist this exact
+    /// value so download and lookup resolve folder
+    /// `openai_whisper-large-v3-v20240930_turbo` without prefix guessing.
     var name: String {
         switch self {
         case .tinyEN: "tiny.en"
         case .baseEN: "base.en"
         case .smallEN: "small.en"
         case .small: "small"
-        case .largeV3Turbo: "large-v3_turbo"
+        case .largeV3Turbo: "large-v3-v20240930_turbo"
         case .hinglish: "Oriserve_Whisper-Hindi2Hinglish-Prime_889MB"
         // whisperkittools names the generated folder after the source repo
         // with `/` → `_`; that folder name IS the variant WhisperKit globs for.
@@ -177,7 +167,7 @@ enum WhisperModelOption: CaseIterable {
         case .baseEN: "145 MB"
         case .smallEN, .small: "480 MB"
         case .hinglish: "890 MB"
-        case .largeV3Turbo: "1.5 GB"
+        case .largeV3Turbo: "1.64 GB"
         case .hinglishLarge: "2.9 GB"
         case .hinglishLargeRomanized: "2.9 GB"
         }
@@ -198,16 +188,16 @@ enum WhisperModelOption: CaseIterable {
     }
 
 
-    /// The SPEC §4.2 spelling of a variant, still accepted so a value
-    /// persisted before the id above was corrected resolves to its option
-    /// instead of silently reverting to the default.
-    private var legacyName: String? {
-        self == .largeV3Turbo ? "large-v3-turbo" : nil
+    /// Previously persisted spellings remain parse aliases. Reading one
+    /// selects the same option but does not rewrite UserDefaults; a later
+    /// explicit picker change persists the canonical name.
+    private var legacyNames: Set<String> {
+        self == .largeV3Turbo ? ["large-v3-turbo", "large-v3_turbo"] : []
     }
 
     init?(named name: String) {
         guard let match = WhisperModelOption.allCases.first(where: {
-            $0.name == name || $0.legacyName == name
+            $0.name == name || $0.legacyNames.contains(name)
         }) else { return nil }
         self = match
     }
